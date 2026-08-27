@@ -33,10 +33,10 @@ function flog(msg: string): void {
 
 let url = DEFAULT_URL;
 let urlSource = 'default';
-// Reconnect grace: a +1s reconnect on the fresh post-wake session tripped
-// the bsdsocket sysmodule once (v1.0.0-beta.8 field run) — give the
-// sysmodule a few seconds to settle before the first new socket().
-let reconnectMs = 8000;
+// Reconnect grace: +1s (beta.8) AND +8s (beta.11) reconnects both tripped
+// the bsdsocket sysmodule at connect() — testing whether the sysmodule
+// heals given a full minute (60s default; config override reconnectMs).
+let reconnectMs = 60000;
 try {
 	// NOTE: Switch.file(path).json() returns a PROMISE — awaiting is not
 	// optional (reading properties off the promise yields undefined and
@@ -57,7 +57,7 @@ try {
 }
 const masked = url.replace(/token=[^&]+/, 'token=***');
 flog(
-	`boot url=${masked} source=${urlSource} reconnect=${reconnectMs}ms`,
+	`boot MODE=HOLD url=${masked} source=${urlSource}`,
 );
 
 let state = 'boot';
@@ -68,10 +68,14 @@ let lastEvent = 'boot';
 let lastError = '';
 let lastBeat = Date.now();
 let beats = 0;
+// Hold mode: retry connections until the first successful open, then NEVER
+// reconnect — used to test whether the post-wake console bomb is armed by
+// the reconnect itself or ticks regardless of any post-wake network use.
+let connectedOnce = false;
 
 function render() {
 	console.clear();
-	console.log('\x1b[1mwake-test\x1b[0m — sleep/wake socket harness');
+	console.log('\x1b[1mwake-test6 [HOLD MODE]\x1b[0m — NO reconnect after wake');
 	console.log(`url:         ${masked} (${urlSource})`);
 	console.log(`reconnect:   ${reconnectMs}ms`);
 	console.log(`state:       ${state}`);
@@ -107,6 +111,7 @@ function connect() {
 	}
 	ws.addEventListener('open', () => {
 		state = 'connected';
+		connectedOnce = true;
 		connects++;
 		lastError = '';
 		mark('open');
@@ -118,6 +123,10 @@ function connect() {
 	ws.addEventListener('close', () => {
 		state = 'disconnected';
 		disconnects++;
+		if (connectedOnce) {
+			mark('close - HOLD (no reconnect; watch heartbeats vs the bomb)');
+			return;
+		}
 		mark('close');
 		setTimeout(connect, reconnectMs);
 	});
@@ -134,9 +143,12 @@ setInterval(() => {
 	if (gap > 60_000) {
 		mark(`heartbeat resumed after ${(gap / 1000).toFixed(0)}s (wake)`);
 	} else {
-		// keep the last-beat line fresh without spamming the visible log
+		// keep the last-beat line fresh without spamming the SD log
 		lastEvent = `heartbeat ${(gap / 1000).toFixed(1)}s @ ${new Date().toISOString()}`;
 	}
+	// Redraw every tick: the visible counter IS the liveness signal (a
+	// frozen screen is indistinguishable from a dead loop otherwise).
+	render();
 }, 5000);
 flog('starting connect loop');
 

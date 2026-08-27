@@ -538,12 +538,15 @@ void nx_tcp_close(const FunctionCallbackInfo<Value> &info) {
 //      read/write/close calls against them fail fast with EBADF instead
 //      of touching the sysmodule.
 //   3. Tear down and re-open the bsd service session (socketExit +
-//      socketInitialize). This REMOVES the corpse from the sysmodule
-//      before any post-wake poll can walk it — the single field-proven
-//      way to survive wake with an established socket (v1.0.2: minutes
-//      of post-wake heartbeats, clean exit, zero crash reports). Only
-//      runs when a socket was actually held at sleep (count > 0), so
-//      socket-less apps keep their session and libuv plumbing intact.
+//      socketInitialize), UNCONDITIONALLY on every detected wake — with or
+//      without held sockets. This removes the wake-stale session whose
+//      first post-wake poll asserts the sysmodule (User Break at
+//      bsdsocket+0xef0f0) — the single field-proven way to survive wake
+//      (v1.0.2: minutes of post-wake heartbeats, clean exit, zero crash
+//      reports; v1.0.0-beta.11: timers and traffic alive through it).
+//      The earlier libuv-self-wake/timer-death fear that motivated skipping
+//      it for socket-less apps was a display artifact (a harness bug froze
+//      the on-screen counters; the timers were fine all along).
 //   4. Snapshot + detach the stale registry, then fire every pending JS
 //      op with ECONNRESET — apps observe their sockets dying and
 //      reconnect on the fresh session. Apps should wait a few seconds
@@ -566,8 +569,12 @@ static void nx_tcp_wake_reset_impl(void) {
 	for (fd_reg_node_t *n = g_tcp_fds; n; n = n->next)
 		count++;
 	fprintf(stderr, "[tcp] wake reset: %d socket(s)\n", count);
-	if (count == 0)
-		return; // nothing held at sleep — nothing to do
+	// UNCONDITIONAL session reset below — the count==0 early-exit was wrong:
+	// a wake-stale bsd session trips the sysmodule at the first post-wake
+	// poll even with ZERO user sockets (libuv polls its own internal fds on
+	// the session every frame; field-verified: a tokenless refused-loop app
+	// with no established socket at sleep died ~5s post-wake when the
+	// reset was skipped). Every wake must drop and re-open the session.
 
 	// 1. + 2.
 	for (fd_reg_node_t *n = g_tcp_fds; n; n = n->next) {

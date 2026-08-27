@@ -14,7 +14,7 @@ function flog(msg) {
 }
 var url = DEFAULT_URL;
 var urlSource = "default";
-var reconnectMs = 8e3;
+var reconnectMs = 6e4;
 try {
   const cfg = await Promise.race([
     Switch.file(CONFIG_PATH).json(),
@@ -31,7 +31,7 @@ try {
 }
 var masked = url.replace(/token=[^&]+/, "token=***");
 flog(
-  `boot url=${masked} source=${urlSource} reconnect=${reconnectMs}ms`
+  `boot MODE=HOLD url=${masked} source=${urlSource}`
 );
 var state = "boot";
 var connects = 0;
@@ -41,9 +41,10 @@ var lastEvent = "boot";
 var lastError = "";
 var lastBeat = Date.now();
 var beats = 0;
+var connectedOnce = false;
 function render() {
   console.clear();
-  console.log("\x1B[1mwake-test\x1B[0m \u2014 sleep/wake socket harness");
+  console.log("\x1B[1mwake-test6 [HOLD MODE]\x1B[0m \u2014 NO reconnect after wake");
   console.log(`url:         ${masked} (${urlSource})`);
   console.log(`reconnect:   ${reconnectMs}ms`);
   console.log(`state:       ${state}`);
@@ -77,6 +78,7 @@ function connect() {
   }
   ws.addEventListener("open", () => {
     state = "connected";
+    connectedOnce = true;
     connects++;
     lastError = "";
     mark("open");
@@ -88,6 +90,10 @@ function connect() {
   ws.addEventListener("close", () => {
     state = "disconnected";
     disconnects++;
+    if (connectedOnce) {
+      mark("close - HOLD (no reconnect; watch heartbeats vs the bomb)");
+      return;
+    }
     mark("close");
     setTimeout(connect, reconnectMs);
   });
@@ -105,6 +111,7 @@ setInterval(() => {
   } else {
     lastEvent = `heartbeat ${(gap / 1e3).toFixed(1)}s @ ${(/* @__PURE__ */ new Date()).toISOString()}`;
   }
+  render();
 }, 5e3);
 flog("starting connect loop");
 render();
