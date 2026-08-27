@@ -16,6 +16,11 @@
 
 using namespace v8;
 
+// Defined in main.cc: tears down and re-opens the bsd service session using
+// the effective SocketInitConfig (used by nx_tcp_wake_reset()). NOTE: this
+// declaration must stay at GLOBAL scope — an anonymous-namespace copy
+// shadows the definition and fails to link (learned the hard way).
+Result nx_socket_session_reset(void);
 
 namespace {
 
@@ -517,31 +522,35 @@ void nx_tcp_close(const FunctionCallbackInfo<Value> &info) {
 
 // ---- wake reset ----
 // Called by the main loop when a wall-clock gap between frames means the
-// console slept and woke. Socket state does not survive sleep, and both
-// post-wake polls on the stale fds and post-wake session resets proved
-// catastrophic:
+// console slept and woke. Socket state does not survive sleep, and the
+// wake-dead established connection ("corpse") left in the bsd session's
+// tables asserts the bsdsocket sysmodule (User Break at bsdsocket+0xef0f0,
+// taking down hbloader/hbmenu/qlaunch) the moment ANY poll runs on that
+// session — even a poll that only touches healthy fds (field-verified via
+// per-boot logs on v1.0.0-beta.10: a full soft reset completed cleanly,
+// death struck at the very next uv_run).
 //
-//   - Polling a wake-dead fd spins the bsdsocket sysmodule into an internal
-//     assertion (User Break) that takes down hbloader, hbmenu, qlaunch and
-//     every socket-holding process on the console.
-//   - Resetting the bsd service session (socketExit + socketInitialize)
-//     destroys libuv-horizon's own self-wake socketpair, orphaning the
-//     event loop: setInterval timers never fire again (field-verified),
-//     and with live sockets the path escalates to a hard console crash.
-//     (ftpd natively proves the session itself survives wake fine — the
-//     session reset was both destructive and unnecessary.)
-//
-// The soft reset, in order:
+// The v5 reset, in order:
 //   1. Stop every poll handle (uv__io_poll must never see the dead fds).
 //   2. Mark the fds dead (bounded registry) — they are NEVER closed:
 //      close() on a wake-dead socket is exactly the class of sysmodule
-//      op that asserts. They leak (a handful per sleep); read/write/close
-//      calls against them fail fast with EBADF instead of touching the
-//      sysmodule.
-//   3. Snapshot + detach the stale registry, then fire every pending JS
-//      op with ECONNRESET — apps observe their sockets dying and reconnect
-//      on the intact session (~1 s later), which works (ftpd-verified).
-//   4. Free the stale poll handles WITHOUT close().
+//      op that asserts. They die with the session in step 3 anyway;
+//      read/write/close calls against them fail fast with EBADF instead
+//      of touching the sysmodule.
+//   3. Tear down and re-open the bsd service session (socketExit +
+//      socketInitialize). This REMOVES the corpse from the sysmodule
+//      before any post-wake poll can walk it — the single field-proven
+//      way to survive wake with an established socket (v1.0.2: minutes
+//      of post-wake heartbeats, clean exit, zero crash reports). Only
+//      runs when a socket was actually held at sleep (count > 0), so
+//      socket-less apps keep their session and libuv plumbing intact.
+//   4. Snapshot + detach the stale registry, then fire every pending JS
+//      op with ECONNRESET — apps observe their sockets dying and
+//      reconnect on the fresh session. Apps should wait a few seconds
+//      before reconnecting (wake-test harness default: 8 s) — a +1 s
+//      reconnect tripped the sysmodule once (v1.0.0-beta.8 field run).
+//   5. Free the stale poll handles WITHOUT close() (fds died with the
+//      session; close() on them is meaningless at best).
 static int g_dead_fds[64];
 static int g_dead_fd_count = 0;
 
@@ -571,7 +580,17 @@ static void nx_tcp_wake_reset_impl(void) {
 	}
 	fprintf(stderr, "[tcp] wake reset: polls stopped, fds dead-marked\n");
 
-	// 3.
+	// 3. Remove the corpse from the sysmodule before any post-wake poll.
+	// (nx_socket_session_reset is defined in main.cc — it re-uses the
+	// effective SocketInitConfig selected for the current memory regime.)
+	Result rc = nx_socket_session_reset();
+	if (R_FAILED(rc)) {
+		fprintf(stderr,
+		        "[tcp] wake reset: socketInitialize failed 0x%x\n", rc);
+	}
+	fprintf(stderr, "[tcp] wake reset: bsd session reset\n");
+
+	// 5.
 	fd_reg_node_t *stale = g_tcp_fds;
 	g_tcp_fds = nullptr;
 	for (fd_reg_node_t *n = stale; n; n = n->next) {
@@ -602,7 +621,7 @@ static void nx_tcp_wake_reset_impl(void) {
 	}
 	fprintf(stderr, "[tcp] wake reset: stale ops fired (ECONNRESET)\n");
 
-	// 4.
+	// 5.
 	while (stale) {
 		fd_reg_node_t *node = stale;
 		stale = stale->next;

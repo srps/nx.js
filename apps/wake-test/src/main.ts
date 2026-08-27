@@ -16,6 +16,7 @@ const LOG_PATH = 'sdmc:/switch/wake-test.log';
 
 interface Config {
 	url?: string;
+	reconnectMs?: number;
 }
 
 // SD event log (synchronous appends — survives hard kills).
@@ -32,6 +33,10 @@ function flog(msg: string): void {
 
 let url = DEFAULT_URL;
 let urlSource = 'default';
+// Reconnect grace: a +1s reconnect on the fresh post-wake session tripped
+// the bsdsocket sysmodule once (v1.0.0-beta.8 field run) — give the
+// sysmodule a few seconds to settle before the first new socket().
+let reconnectMs = 8000;
 try {
 	// NOTE: Switch.file(path).json() returns a PROMISE — awaiting is not
 	// optional (reading properties off the promise yields undefined and
@@ -44,11 +49,16 @@ try {
 		url = cfg.url;
 		urlSource = 'sdmc config';
 	}
+	if (cfg?.reconnectMs && cfg.reconnectMs >= 100) {
+		reconnectMs = cfg.reconnectMs;
+	}
 } catch {
 	// no config file — use default
 }
 const masked = url.replace(/token=[^&]+/, 'token=***');
-flog(`boot url=${masked} source=${urlSource}`);
+flog(
+	`boot url=${masked} source=${urlSource} reconnect=${reconnectMs}ms`,
+);
 
 let state = 'boot';
 let connects = 0;
@@ -63,6 +73,7 @@ function render() {
 	console.clear();
 	console.log('\x1b[1mwake-test\x1b[0m — sleep/wake socket harness');
 	console.log(`url:         ${masked} (${urlSource})`);
+	console.log(`reconnect:   ${reconnectMs}ms`);
 	console.log(`state:       ${state}`);
 	console.log(`connects:    ${connects}   disconnects: ${disconnects}`);
 	console.log(`messages:    ${messages}   heartbeats: ${beats}`);
@@ -91,7 +102,7 @@ function connect() {
 		ws = new WebSocket(url);
 	} catch (e) {
 		mark('ws constructor threw', String(e));
-		setTimeout(connect, 2000);
+		setTimeout(connect, reconnectMs);
 		return;
 	}
 	ws.addEventListener('open', () => {
@@ -108,7 +119,7 @@ function connect() {
 		state = 'disconnected';
 		disconnects++;
 		mark('close');
-		setTimeout(connect, 1000);
+		setTimeout(connect, reconnectMs);
 	});
 	ws.addEventListener('error', () => {
 		mark('error event');

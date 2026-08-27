@@ -1304,9 +1304,23 @@ static const SocketInitConfig *nx_effective_socket_cfg(void) {
 // sleep/wake reset — see nx_tcp_wake_reset() in tcp.cc). Returns the
 // socketInitialize() result. All socket fds held by the process become
 // invalid when the old session closes; callers must not close() them.
-// Defined in tcp.cc: soft socket-layer reset for console sleep/wake (called
-// from the main event loop). Does NOT touch the bsd service session — see
-// tcp.cc for why (libuv-horizon's self-wake socketpair lives on it).
+// Tear down and re-open the bsd service session (called by the runtime's
+// sleep/wake reset — see nx_tcp_wake_reset() in tcp.cc). Returns the
+// socketInitialize() result. All socket fds held by the process become
+// invalid when the old session closes; callers must not close() them.
+// This is REQUIRED, not optional: a wake-dead established connection left
+// in the session's tables asserts the bsdsocket sysmodule at the first
+// post-wake poll (User Break at bsdsocket+0xef0f0, field-verified via
+// per-boot logs on v1.0.0-beta.10: full soft reset completed, death at the
+// next uv_run). Dropping the session removes the corpse before any poll
+// runs (v1.0.2 field pass: minutes of post-wake heartbeats, clean exit).
+Result nx_socket_session_reset(void) {
+	socketExit();
+	return socketInitialize(&g_effective_socket_cfg);
+}
+
+// Defined in tcp.cc: socket-layer teardown + bsd session reset for console
+// sleep/wake (called from the main event loop).
 void nx_tcp_wake_reset(void);
 
 // Resolve the user entrypoint and (for standalone / bootstrap-.nro launches)

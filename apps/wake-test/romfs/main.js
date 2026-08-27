@@ -14,6 +14,7 @@ function flog(msg) {
 }
 var url = DEFAULT_URL;
 var urlSource = "default";
+var reconnectMs = 8e3;
 try {
   const cfg = await Promise.race([
     Switch.file(CONFIG_PATH).json(),
@@ -23,10 +24,15 @@ try {
     url = cfg.url;
     urlSource = "sdmc config";
   }
+  if (cfg?.reconnectMs && cfg.reconnectMs >= 100) {
+    reconnectMs = cfg.reconnectMs;
+  }
 } catch {
 }
 var masked = url.replace(/token=[^&]+/, "token=***");
-flog(`boot url=${masked} source=${urlSource}`);
+flog(
+  `boot url=${masked} source=${urlSource} reconnect=${reconnectMs}ms`
+);
 var state = "boot";
 var connects = 0;
 var disconnects = 0;
@@ -39,6 +45,7 @@ function render() {
   console.clear();
   console.log("\x1B[1mwake-test\x1B[0m \u2014 sleep/wake socket harness");
   console.log(`url:         ${masked} (${urlSource})`);
+  console.log(`reconnect:   ${reconnectMs}ms`);
   console.log(`state:       ${state}`);
   console.log(`connects:    ${connects}   disconnects: ${disconnects}`);
   console.log(`messages:    ${messages}   heartbeats: ${beats}`);
@@ -65,7 +72,7 @@ function connect() {
     ws = new WebSocket(url);
   } catch (e) {
     mark("ws constructor threw", String(e));
-    setTimeout(connect, 2e3);
+    setTimeout(connect, reconnectMs);
     return;
   }
   ws.addEventListener("open", () => {
@@ -82,7 +89,7 @@ function connect() {
     state = "disconnected";
     disconnects++;
     mark("close");
-    setTimeout(connect, 1e3);
+    setTimeout(connect, reconnectMs);
   });
   ws.addEventListener("error", () => {
     mark("error event");
