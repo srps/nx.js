@@ -250,9 +250,37 @@ void poll_dispatch_cb(uv_poll_t *handle, int status, int events) {
 		if (!still_pending)
 			continue;
 		if (status < 0) {
+			// uv-level error (e.g. -EBADF, -EINVAL). Log it: these were
+			// previously silent and left ops armed on dead sockets.
+			fprintf(stderr,
+			        "[tcp] fd %d poll status=%d (%s), completing op\n",
+			        op->fd, status, uv_strerror(status));
 			op->on_ready(op, status); // propagate error (negative)
 		} else if (events & op->events) {
 			op->on_ready(op, events);
+		} else if (events & UV_DISCONNECT) {
+			// Sleep/wake kills sockets: the bsdsocket sysmodule reports
+			// disconnect-type events that do NOT match the op's interest
+			// mask (e.g. POLLHUP against a UV_READABLE op). Dropping them
+			// left the op armed forever — JS never saw the error, libuv
+			// kept polling the dead fd every frame, and the sysmodule
+			// eventually hit an internal assertion (User Break in
+			// bsdsocket), taking hbloader and every socket-holding process
+			// down with it. Complete the op with ECONNRESET so the JS
+			// layer sees the disconnect and can reconnect cleanly.
+			fprintf(stderr,
+			        "[tcp] fd %d disconnect event %#x (interest %#x), "
+			        "completing op with ECONNRESET\n",
+			        op->fd, events, op->events);
+			op->on_ready(op, -ECONNRESET);
+		} else if (events) {
+			// Unmatched non-zero events (e.g. POLLNVAL-style). Never spin
+			// silently on these; surface and complete.
+			fprintf(stderr,
+			        "[tcp] fd %d unmatched poll event %#x (interest %#x), "
+			        "completing op with error\n",
+			        op->fd, events, op->events);
+			op->on_ready(op, -EIO);
 		}
 	}
 	delete[] snapshot;
@@ -359,6 +387,8 @@ void read_on_ready(op_t *op, int events) {
 	if (n < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
 			return; // spurious wakeup; keep polling
+		fprintf(stderr, "[tcp] fd %d recv error: %s\n", op->fd,
+		        strerror(errno));
 		op_finish(op, make_errno(iso, errno), Undefined(iso));
 		return;
 	}
@@ -399,6 +429,8 @@ void write_on_ready(op_t *op, int events) {
 	if (n < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
 			return;
+		fprintf(stderr, "[tcp] fd %d send error: %s\n", op->fd,
+		        strerror(errno));
 		op_finish(op, make_errno(iso, errno), Undefined(iso));
 		return;
 	}
