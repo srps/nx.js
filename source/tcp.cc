@@ -569,6 +569,7 @@ static void nx_tcp_wake_reset_impl(void) {
 		if (g_dead_fd_count < 64)
 			g_dead_fds[g_dead_fd_count++] = fp->fd;
 	}
+	fprintf(stderr, "[tcp] wake reset: polls stopped, fds dead-marked\n");
 
 	// 3.
 	fd_reg_node_t *stale = g_tcp_fds;
@@ -599,6 +600,7 @@ static void nx_tcp_wake_reset_impl(void) {
 		}
 		fp->ops = nullptr;
 	}
+	fprintf(stderr, "[tcp] wake reset: stale ops fired (ECONNRESET)\n");
 
 	// 4.
 	while (stale) {

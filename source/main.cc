@@ -83,7 +83,12 @@ NX_MODULE(window);
 
 using namespace v8;
 
-#define LOG_FILENAME "nxjs-debug.log"
+// Per-boot debug log filename (built at boot, see the freopen site): a unique
+// name per boot defeats the MTP/DBI read cache, which otherwise serves stale
+// contents for a fixed filename indefinitely (field-verified: the flight
+// recorder was blind across two on-device incidents because of it). Crashed
+// boots keep their file; clean exits delete it when empty (delete_if_empty).
+static char g_log_filename[96];
 
 // runtime.js source, embedded as a byte array by the build (runtime_js.c).
 extern "C" const unsigned char nxjs_runtime_js[];
@@ -1433,8 +1438,16 @@ int main(int argc, char *argv[]) {
 	// Redirect stderr to the on-SD debug log NOW (before socket init and the
 	// config parse) so that `[config]`/`[v8]`/`[skia]` diagnostics — including
 	// any "value not honored" lines from the nxjs.ini parse below — are
-	// captured to sdmc:/switch/nxjs-debug.log.
-	g_debug_fd = freopen(LOG_FILENAME, "w", stderr);
+	// captured. The filename is unique per boot (version + unix time):
+	// sdmc:/nx.js/nxjs-debug-<version>-<epoch>.log.
+	snprintf(g_log_filename, sizeof(g_log_filename),
+	         "nxjs-debug-%s-%u.log", NXJS_VERSION, (unsigned)time(NULL));
+	g_debug_fd = freopen(g_log_filename, "w", stderr);
+	// Crash forensics: stderr redirected to a file is fully buffered by
+	// default, so lines from a crashing path sit in the buffer and never
+	// reach the SD. Unbuffered mode makes every breadcrumb (boot banner,
+	// wake detector, reset steps) land immediately.
+	setvbuf(stderr, nullptr, _IONBF, 0);
 
 	// Take a process-lifetime nvdrv reference NOW, while memory is plentiful.
 	// The libnx PrintConsole/Framebuffer stack nvInitialize()/nvExit()s around
@@ -1947,6 +1960,11 @@ int main(int argc, char *argv[]) {
 						        (unsigned long long)(
 						            now_wall - s_last_frame_wall));
 						nx_tcp_wake_reset();
+						// Breadcrumb: distinguishes a death
+						// INSIDE the reset from one after it
+						// (stderr is unbuffered — it lands).
+						fprintf(stderr,
+						        "[nxjs] wake reset returned\n");
 					}
 					s_last_frame_wall = now_wall;
 				}
@@ -2146,7 +2164,7 @@ int main(int argc, char *argv[]) {
 		fclose(g_debug_fd);
 		g_debug_fd = NULL;
 	}
-	delete_if_empty(LOG_FILENAME);
+	delete_if_empty(g_log_filename);
 
 	// CRITICAL: V8 maps its arenas via manual
 	// svcMapMemory, which libnx's NRO exit does NOT unmap. Release them as the
