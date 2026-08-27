@@ -6,11 +6,15 @@
  * The fixture uses only public APIs (fetch) — see fixture.ts for what each
  * scenario guards.
  *
+ * NOTE: the binary is spawned (not execSync'd) so the Node event loop stays
+ * alive — the peer server lives in THIS process and could never answer
+ * requests while a synchronous exec blocks the loop.
+ *
  * Requires the nxjs-test binary (cmake build; done automatically in CI's
  * pacman-packages container). Skipped when the binary is absent so local
  * `pnpm test` without a cmake build still passes.
  */
-import { execSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -73,19 +77,30 @@ describe('tcp dispatch (host)', () => {
 	it.skipIf(!existsSync(BINARY))(
 		'idle-read tolerance + disconnect surfacing + fresh sockets',
 		async () => {
-			const output = execSync(`"${BINARY}" "${RUNTIME}" "${OUT}"`, {
-				timeout: 60_000,
-				encoding: 'utf8',
-				stdio: ['ignore', 'pipe', 'pipe'],
+			const { code, out } = await new Promise<{
+				code: number;
+				out: string;
+			}>((resolve, reject) => {
+				const p = spawn(BINARY, [RUNTIME, OUT], {
+					stdio: ['ignore', 'pipe', 'pipe'],
+				});
+				let out = '';
+				p.stdout?.on('data', (d) => (out += d));
+				p.stderr?.on('data', (d) => (out += d));
+				p.on('close', (code) => resolve({ code: code ?? -1, out }));
+				p.on('error', reject);
 			});
-			const tap = parseTap(output);
-			if (tap.summary.fail > 0) {
+
+			const tap = parseTap(out);
+			if (tap.summary.fail > 0 || code !== 0) {
 				// Surface the raw TAP in the test log — the summary alone
 				// hides which assertions failed and why.
-				console.error('--- fixture TAP output ---\n' + output);
+				console.error(`--- fixture TAP output (exit ${code}) ---\n${out}`);
 			}
+			expect(code).toBe(0);
 			expect(tap.summary.fail).toBe(0);
 			expect(tap.summary.pass).toBeGreaterThan(0);
 		},
+		60_000,
 	);
 });

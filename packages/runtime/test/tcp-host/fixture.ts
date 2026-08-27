@@ -42,13 +42,15 @@ test('tcp: read pending across an idle period still delivers', async (t) => {
 });
 
 test('tcp: abrupt disconnect surfaces as an error', async (t) => {
-	let surfaced = false;
+	// Outcome-based (not catch-based): a timed-out fetch must NOT count as
+	// "surfaced" — only a genuine rejection does.
+	let outcome: 'rejected' | 'resolved' = 'resolved';
 	try {
-		await withTimeout(fetch(`${base}/abort`), 8000, '/abort fetch');
+		await fetch(`${base}/abort`);
 	} catch {
-		surfaced = true; // rejection is the expected outcome
+		outcome = 'rejected';
 	}
-	t.ok(surfaced, 'fetch rejected (disconnect surfaced to JS)');
+	t.equal(outcome, 'rejected', 'fetch rejected (disconnect surfaced to JS)');
 });
 
 test('tcp: fresh connections work after a disconnect', async (t) => {
