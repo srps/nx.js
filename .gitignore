@@ -33,3 +33,4 @@ node_modules
 /.vscode/cache.db*
 test/runtime/build/
 test/runtime/dist/
+nxjs-v*.nro
