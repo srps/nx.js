@@ -13,6 +13,7 @@
 #include <mbedtls/version.h>
 #include <png.h>
 #include <switch.h>
+#include <time.h>
 #include <turbojpeg.h>
 #include <uv.h>
 #include <v8.h>
@@ -600,6 +601,11 @@ static void nx_framebuffer_init(const FunctionCallbackInfo<Value> &info) {
 	    want_gpu ? nx_skia_gpu_screen_init(width, height, /*samples=*/4,
 	                                       gpu_cache_mib)
 	             : nullptr;
+	// Self-identify in nxjs-debug.log: runtime version + libnx build.
+	// (MTP metadata lies; this line is the ground truth for which
+	// runtime NRO actually booted.)
+	fprintf(stderr, "[nxjs] runtime v%s (libnx %s)\n", NXJS_VERSION,
+	        LIBNX_VERSION);
 	if (gpu) {
 		nx_canvas_set_gpu_surface(canvas, gpu);
 		screen_is_gpu = true;
@@ -1289,6 +1295,19 @@ static const SocketInitConfig *nx_effective_socket_cfg(void) {
 	return &g_effective_socket_cfg;
 }
 
+// Tear down and re-open the bsd service session (called by the runtime's
+// sleep/wake reset — see nx_tcp_wake_reset() in tcp.cc). Returns the
+// socketInitialize() result. All socket fds held by the process become
+// invalid when the old session closes; callers must not close() them.
+Result nx_socket_session_reset(void) {
+	socketExit();
+	return socketInitialize(&g_effective_socket_cfg);
+}
+
+// Defined in tcp.cc: full socket-layer teardown + bsd session reset for
+// console sleep/wake (called from the main event loop).
+void nx_tcp_wake_reset(void);
+
 // Resolve the user entrypoint and (for standalone / bootstrap-.nro launches)
 // mount `romfs:`. Hoisted out of main()'s body so it can run BEFORE V8 init:
 // the entrypoint directory is needed to locate `nxjs.ini`, whose [v8]/[memory]
@@ -1909,6 +1928,27 @@ int main(int argc, char *argv[]) {
 			if (!screen_is_gpu && !nx_webgl_active() && !applet_active)
 				break;
 			if (!nx_ctx->had_error) {
+				// Sleep/wake detection: a >=60s wall-clock gap between
+				// frames means the console slept. Socket state did not
+				// survive: reset the whole socket layer BEFORE uv_run can
+				// poll a dead fd — post-wake polls/ops on the stale bsd
+				// session trip a bsdsocket sysmodule assertion (User
+				// Break) that takes the console down. Pending JS ops get
+				// ECONNRESET so apps reconnect on the fresh session.
+				{
+					static u64 s_last_frame_wall = 0;
+					u64 now_wall = (u64)time(NULL);
+					if (s_last_frame_wall != 0 &&
+					    now_wall - s_last_frame_wall >= 60) {
+						fprintf(stderr,
+						        "[nxjs] wake detected (frame gap "
+						        "%llus) - resetting sockets\n",
+						        (unsigned long long)(
+						            now_wall - s_last_frame_wall));
+						nx_tcp_wake_reset();
+					}
+					s_last_frame_wall = now_wall;
+				}
 				// libuv: sockets, fs, dns, threadpool afters, timers.
 				uv_run(&loop, UV_RUN_NOWAIT);
 				// Drain V8 microtasks (promise reactions).

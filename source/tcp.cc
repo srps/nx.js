@@ -16,6 +16,10 @@
 
 using namespace v8;
 
+// Defined in main.cc: tears down and re-opens the bsd service session using
+// the effective SocketInitConfig (used by nx_tcp_wake_reset()).
+Result nx_socket_session_reset(void);
+
 namespace {
 
 // Set a socket non-blocking.
@@ -268,19 +272,16 @@ void poll_dispatch_cb(uv_poll_t *handle, int status, int events) {
 			// bsdsocket), taking hbloader and every socket-holding process
 			// down with it. Complete the op with ECONNRESET so the JS
 			// layer sees the disconnect and can reconnect cleanly.
+			//
+			// NOTE: only UV_DISCONNECT is treated as fatal here. Other
+			// unmatched bits (e.g. WRITABLE while only a read op is armed)
+			// are BENIGN and must be ignored — completing ops on them
+			// kills every healthy connection (field-verified regression).
 			fprintf(stderr,
 			        "[tcp] fd %d disconnect event %#x (interest %#x), "
 			        "completing op with ECONNRESET\n",
 			        op->fd, events, op->events);
 			op->on_ready(op, -ECONNRESET);
-		} else if (events) {
-			// Unmatched non-zero events (e.g. POLLNVAL-style). Never spin
-			// silently on these; surface and complete.
-			fprintf(stderr,
-			        "[tcp] fd %d unmatched poll event %#x (interest %#x), "
-			        "completing op with error\n",
-			        op->fd, events, op->events);
-			op->on_ready(op, -EIO);
 		}
 	}
 	delete[] snapshot;
@@ -495,6 +496,91 @@ void nx_tcp_close(const FunctionCallbackInfo<Value> &info) {
 	}
 }
 
+// ---- wake reset ----
+// Called by the main loop when a >=60s wall-clock gap between frames means
+// the console slept and woke. Socket state never survives sleep: the
+// bsdsocket sysmodule reports disconnect-type events for the dead sockets,
+// and post-wake socket operations on the stale bsd service session can trip
+// a sysmodule assertion (User Break in bsdsocket) that takes down hbloader,
+// hbmenu, and every other socket-holding process on the console.
+//
+// The reset, in order:
+//   1. Stop every poll handle (uv__io_poll must never see the dead fds).
+//   2. Tear down and re-open the bsd service session (socketExit +
+//      socketInitialize): all socket fds become invalid sysmodule-side,
+//      together with any stale per-session state.
+//   3. Snapshot + detach the stale registry, then fire every pending JS op
+//      with ECONNRESET — apps observe their sockets dying and reconnect on
+//      the fresh session. (Callbacks may open new sockets here; their
+//      registry nodes prepend to the now-empty list and are NOT touched by
+//      step 4.)
+//   4. Free the stale poll handles WITHOUT close(): the fds died with the
+//      old session; close() on them is meaningless at best.
+static void nx_tcp_wake_reset_impl(void) {
+	int count = 0;
+	for (fd_reg_node_t *n = g_tcp_fds; n; n = n->next)
+		count++;
+	fprintf(stderr, "[tcp] wake reset: %d socket(s)\n", count);
+
+	// 1.
+	for (fd_reg_node_t *n = g_tcp_fds; n; n = n->next) {
+		fd_poll_t *fp = n->entry;
+		uv_poll_stop(&fp->poll);
+		fp->closing = true; // fd_poll_get/refresh must not revive it
+		fp->close_fd = false;
+	}
+
+	// 2. (nx_socket_session_reset is defined in main.cc — it re-uses the
+	// effective SocketInitConfig selected for the current memory regime.)
+	Result rc = nx_socket_session_reset();
+	if (R_FAILED(rc)) {
+		fprintf(stderr,
+		        "[tcp] wake reset: socketInitialize failed 0x%x\n", rc);
+	}
+
+	// 3.
+	fd_reg_node_t *stale = g_tcp_fds;
+	g_tcp_fds = nullptr;
+	for (fd_reg_node_t *n = stale; n; n = n->next) {
+		fd_poll_t *fp = n->entry;
+		Isolate *iso = fp->iso;
+		HandleScope scope(iso);
+		Context::Scope cs(iso->GetCurrentContext());
+		Local<Value> err = make_errno(iso, ECONNRESET);
+		op_t *o = fp->ops;
+		while (o) {
+			op_t *next = o->next;
+			Local<Function> cb = o->callback.Get(iso);
+			if (!cb.IsEmpty()) {
+				TryCatch try_catch(iso);
+				Local<Value> args[] = {err, Undefined(iso)};
+				Local<Value> ret;
+				if (!cb->Call(iso->GetCurrentContext(), Null(iso), 2, args)
+				         .ToLocal(&ret)) {
+					nx_emit_error_event(iso, &try_catch);
+				}
+			}
+			o->callback.Reset();
+			o->buffer.Reset();
+			delete o;
+			o = next;
+		}
+		fp->ops = nullptr;
+	}
+
+	// 4.
+	while (stale) {
+		fd_reg_node_t *node = stale;
+		stale = stale->next;
+		fd_poll_t *fp = node->entry;
+		delete node;
+		uv_close((uv_handle_t *)&fp->poll, [](uv_handle_t *h) {
+			delete static_cast<fd_poll_t *>(h->data);
+		});
+	}
+	fprintf(stderr, "[tcp] wake reset complete\n");
+}
+
 // ---- TCP server ----
 struct server_t {
 	uv_poll_t poll;
@@ -598,6 +684,12 @@ void nx_tcp_init_server(const FunctionCallbackInfo<Value> &info) {
 }
 
 } // namespace
+
+// Global-namespace wrapper (declared in main.cc): the impl lives in the
+// anonymous namespace above with the rest of the fd/registry machinery.
+void nx_tcp_wake_reset(void) {
+	nx_tcp_wake_reset_impl();
+}
 
 void nx_init_tcp(Isolate *iso, Local<Object> init_obj) {
 	NX_SET_FUNC(init_obj, "connect", nx_tcp_connect);
