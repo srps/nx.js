@@ -71,5 +71,5 @@ its requirement, so no other changes are needed. Notes:
   nx.js's dropped-event handling and stale-session usage tripped the
   sysmodule assert.
 
-Commits: `0b07a47` (UV_DISCONNECT dispatch + breadcrumbs),
-`f4e7e47` (wake reset), plus test/CI/docs on this branch.
+Commits: `6a762ef` (UV_DISCONNECT dispatch + breadcrumbs),
+`e81020c` (wake reset), plus test/CI/docs on this branch.
