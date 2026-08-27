@@ -1928,18 +1928,23 @@ int main(int argc, char *argv[]) {
 			if (!screen_is_gpu && !nx_webgl_active() && !applet_active)
 				break;
 			if (!nx_ctx->had_error) {
-				// Sleep/wake detection: a >=60s wall-clock gap between
-				// frames means the console slept. Socket state did not
-				// survive: reset the whole socket layer BEFORE uv_run can
-				// poll a dead fd — post-wake polls/ops on the stale bsd
-				// session trip a bsdsocket sysmodule assertion (User
-				// Break) that takes the console down. Pending JS ops get
-				// ECONNRESET so apps reconnect on the fresh session.
+				// Sleep/wake detection: a wall-clock gap between frames means
+				// the console slept (screen-off via the power button sleeps
+				// for even a few seconds). Socket state does not survive ANY
+				// sleep: reset the whole socket layer BEFORE uv_run can poll
+				// a dead fd — post-wake polls/ops on the stale bsd session
+				// trip a bsdsocket sysmodule assertion (User Break) that
+				// takes the console down. The threshold must be LOW (2s):
+				// a 60s threshold missed short sleeps entirely (verified:
+				// a few-seconds screen-off crashed the console). Normal
+				// operation renders every ~16ms; a 2s frame stall without a
+				// single frame is already pathological, and a spurious reset
+				// is recoverable (sockets error, apps reconnect).
 				{
 					static u64 s_last_frame_wall = 0;
 					u64 now_wall = (u64)time(NULL);
 					if (s_last_frame_wall != 0 &&
-					    now_wall - s_last_frame_wall >= 60) {
+					    now_wall - s_last_frame_wall >= 2) {
 						fprintf(stderr,
 						        "[nxjs] wake detected (frame gap "
 						        "%llus) - resetting sockets\n",

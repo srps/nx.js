@@ -11,18 +11,44 @@
  * (any WebSocket echo/server works; default below.)
  */
 const DEFAULT_URL = 'ws://192.168.0.176:8787/';
+const CONFIG_PATH = 'sdmc:/switch/wake-test.json';
+const LOG_PATH = 'sdmc:/switch/wake-test.log';
 
 interface Config {
 	url?: string;
 }
 
+// SD event log (synchronous appends — survives hard kills).
+function flog(msg: string): void {
+	try {
+		(globalThis as any).Switch?.appendFileSync(
+			LOG_PATH,
+			`${new Date().toISOString()} ${msg}\n`,
+		);
+	} catch {
+		/* SD unavailable */
+	}
+}
+
 let url = DEFAULT_URL;
+let urlSource = 'default';
 try {
-	const cfg = (Switch.file('sdmc:/switch/wake-test.json').json() ?? {}) as Config;
-	if (cfg.url) url = cfg.url;
+	// NOTE: Switch.file(path).json() returns a PROMISE — awaiting is not
+	// optional (reading properties off the promise yields undefined and
+	// silently falls back to the default URL).
+	const cfg = (await Promise.race([
+		Switch.file(CONFIG_PATH).json(),
+		new Promise((r) => setTimeout(() => r(null), 5000)),
+	])) as Config | null;
+	if (cfg?.url) {
+		url = cfg.url;
+		urlSource = 'sdmc config';
+	}
 } catch {
 	// no config file — use default
 }
+const masked = url.replace(/token=[^&]+/, 'token=***');
+flog(`boot url=${masked} source=${urlSource}`);
 
 let state = 'boot';
 let connects = 0;
@@ -36,7 +62,7 @@ let beats = 0;
 function render() {
 	console.clear();
 	console.log('\x1b[1mwake-test\x1b[0m — sleep/wake socket harness');
-	console.log(`url:         ${url}`);
+	console.log(`url:         ${masked} (${urlSource})`);
 	console.log(`state:       ${state}`);
 	console.log(`connects:    ${connects}   disconnects: ${disconnects}`);
 	console.log(`messages:    ${messages}   heartbeats: ${beats}`);
@@ -53,6 +79,7 @@ function render() {
 function mark(event: string, err = '') {
 	lastEvent = `${event} @ ${new Date().toISOString()}`;
 	if (err) lastError = err.slice(0, 60);
+	flog(`${event}${err ? ` err=${err.slice(0, 120)}` : ''}`);
 	render();
 }
 
@@ -100,6 +127,7 @@ setInterval(() => {
 		lastEvent = `heartbeat ${(gap / 1000).toFixed(1)}s @ ${new Date().toISOString()}`;
 	}
 }, 5000);
+flog('starting connect loop');
 
 render();
 connect();

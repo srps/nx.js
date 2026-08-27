@@ -1,11 +1,32 @@
 // src/main.ts
 var DEFAULT_URL = "ws://192.168.0.176:8787/";
+var CONFIG_PATH = "sdmc:/switch/wake-test.json";
+var LOG_PATH = "sdmc:/switch/wake-test.log";
+function flog(msg) {
+  try {
+    globalThis.Switch?.appendFileSync(
+      LOG_PATH,
+      `${(/* @__PURE__ */ new Date()).toISOString()} ${msg}
+`
+    );
+  } catch {
+  }
+}
 var url = DEFAULT_URL;
+var urlSource = "default";
 try {
-  const cfg = Switch.file("sdmc:/switch/wake-test.json").json() ?? {};
-  if (cfg.url) url = cfg.url;
+  const cfg = await Promise.race([
+    Switch.file(CONFIG_PATH).json(),
+    new Promise((r) => setTimeout(() => r(null), 5e3))
+  ]);
+  if (cfg?.url) {
+    url = cfg.url;
+    urlSource = "sdmc config";
+  }
 } catch {
 }
+var masked = url.replace(/token=[^&]+/, "token=***");
+flog(`boot url=${masked} source=${urlSource}`);
 var state = "boot";
 var connects = 0;
 var disconnects = 0;
@@ -17,7 +38,7 @@ var beats = 0;
 function render() {
   console.clear();
   console.log("\x1B[1mwake-test\x1B[0m \u2014 sleep/wake socket harness");
-  console.log(`url:         ${url}`);
+  console.log(`url:         ${masked} (${urlSource})`);
   console.log(`state:       ${state}`);
   console.log(`connects:    ${connects}   disconnects: ${disconnects}`);
   console.log(`messages:    ${messages}   heartbeats: ${beats}`);
@@ -33,6 +54,7 @@ function render() {
 function mark(event, err = "") {
   lastEvent = `${event} @ ${(/* @__PURE__ */ new Date()).toISOString()}`;
   if (err) lastError = err.slice(0, 60);
+  flog(`${event}${err ? ` err=${err.slice(0, 120)}` : ""}`);
   render();
 }
 function connect() {
@@ -77,6 +99,7 @@ setInterval(() => {
     lastEvent = `heartbeat ${(gap / 1e3).toFixed(1)}s @ ${(/* @__PURE__ */ new Date()).toISOString()}`;
   }
 }, 5e3);
+flog("starting connect loop");
 render();
 connect();
 //# sourceMappingURL=main.js.map
