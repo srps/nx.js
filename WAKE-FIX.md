@@ -33,16 +33,26 @@ sdmc:/nx.js/nxjs-v<version>.nro
 The slim bootstrap launcher picks the **highest** installed version matching
 its requirement, so no other changes are needed. Notes:
 
-- Version numbers must be plain `1.0.x` releases — semver `^1` ranges reject
-  prereleases, so a `1.0.0-beta.x` build will *not* be picked.
+- This branch tracks upstream's beta line and is versioned accordingly
+  (`1.0.0-beta.7` at the time of writing). If you previously deployed
+  experimental `1.0.x` builds of this fix, **delete them from the SD** (via
+  DBI's file browser on-console — never MTP): release versions outrank
+  prereleases, so a leftover `nxjs-v1.0.x.nro` would keep winning the
+  launcher's pick.
 - **Never delete files on the SD via MTP** (it can wedge DBI's USB transfer
   session) — delete from DBI's own file browser on-console instead.
 
 ## Testing
 
 - **Host (CI)**: `packages/runtime/test/tcp-host.test.ts` runs the runtime's
-  real TCP dispatch code natively and pins the two regression properties
-  (disconnects surface; benign unmatched events don't kill ops).
+  real TCP dispatch code natively through public APIs (`fetch`) against a
+  Node-hosted peer. Verified value (checked by injecting the bugs): it
+  **fails** on the "complete ops on any unmatched event" regression (the
+  kind that killed every healthy connection in the field), and it guards
+  dispatch integrity + build/link breaks. The original wake bug itself —
+  dropped `UV_DISCONNECT` events on wake-killed sockets — is specific to
+  the Switch poll backend's event reporting and is **not reproducible on
+  host**; the on-device protocol below is its guard.
 - **On-device**: `apps/wake-test` + its
   [README](apps/wake-test/README.md) protocol — the 2-minute sleep/wake
   pass/fail procedure.
