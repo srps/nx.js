@@ -16,9 +16,6 @@
 
 using namespace v8;
 
-// Defined in main.cc: tears down and re-opens the bsd service session using
-// the effective SocketInitConfig (used by nx_tcp_wake_reset()).
-Result nx_socket_session_reset(void);
 
 namespace {
 
@@ -72,6 +69,10 @@ struct fd_reg_node_t {
 	fd_reg_node_t *next;
 };
 fd_reg_node_t *g_tcp_fds = nullptr;
+
+// Forward: defined with the wake-reset machinery below; the JS-facing
+// read/write/close entry points check it to fail fast on wake-dead sockets.
+static bool fd_is_dead(int fd);
 
 fd_poll_t *registry_find(int fd) {
 	for (fd_reg_node_t *n = g_tcp_fds; n; n = n->next) {
@@ -411,6 +412,12 @@ void nx_tcp_read(const FunctionCallbackInfo<Value> &info) {
 		nx_throw(iso, "expected ArrayBuffer");
 		return;
 	}
+	// Wake-dead sockets: fail fast instead of arming a poll on a corpse
+	// (post-wake polls on dead fds assert the bsdsocket sysmodule).
+	if (fd_is_dead(fd)) {
+		call_now(iso, cb, make_errno(iso, EBADF), Undefined(iso));
+		return;
+	}
 	op_t *op = op_new(iso, fd, cb, UV_READABLE, read_on_ready);
 	if (!op)
 		return;
@@ -453,6 +460,11 @@ void nx_tcp_write(const FunctionCallbackInfo<Value> &info) {
 		nx_throw(iso, "expected ArrayBuffer");
 		return;
 	}
+	// Wake-dead sockets: fail fast (see nx_tcp_read).
+	if (fd_is_dead(fd)) {
+		call_now(iso, cb, make_errno(iso, EBADF), Undefined(iso));
+		return;
+	}
 	op_t *op = op_new(iso, fd, cb, UV_WRITABLE, write_on_ready);
 	if (!op)
 		return;
@@ -490,6 +502,13 @@ void nx_tcp_close(const FunctionCallbackInfo<Value> &info) {
 		fd_poll_destroy(fp);
 		return;
 	}
+	// Wake-dead sockets: the fd was marked dead by the wake reset and must
+	// never be closed — close() on a wake-dead socket is the class of bsd
+	// sysmodule op that asserts. Silently accept the close (the socket is
+	// inert server-side; it leaks by design, bounded per sleep).
+	if (fd_is_dead(fd)) {
+		return;
+	}
 	// No poll registered on this fd — safe to close directly.
 	if (close(fd)) {
 		nx_throw_errno_error(iso, errno, "close");
@@ -497,45 +516,58 @@ void nx_tcp_close(const FunctionCallbackInfo<Value> &info) {
 }
 
 // ---- wake reset ----
-// Called by the main loop when a >=60s wall-clock gap between frames means
-// the console slept and woke. Socket state never survives sleep: the
-// bsdsocket sysmodule reports disconnect-type events for the dead sockets,
-// and post-wake socket operations on the stale bsd service session can trip
-// a sysmodule assertion (User Break in bsdsocket) that takes down hbloader,
-// hbmenu, and every other socket-holding process on the console.
+// Called by the main loop when a wall-clock gap between frames means the
+// console slept and woke. Socket state does not survive sleep, and both
+// post-wake polls on the stale fds and post-wake session resets proved
+// catastrophic:
 //
-// The reset, in order:
+//   - Polling a wake-dead fd spins the bsdsocket sysmodule into an internal
+//     assertion (User Break) that takes down hbloader, hbmenu, qlaunch and
+//     every socket-holding process on the console.
+//   - Resetting the bsd service session (socketExit + socketInitialize)
+//     destroys libuv-horizon's own self-wake socketpair, orphaning the
+//     event loop: setInterval timers never fire again (field-verified),
+//     and with live sockets the path escalates to a hard console crash.
+//     (ftpd natively proves the session itself survives wake fine — the
+//     session reset was both destructive and unnecessary.)
+//
+// The soft reset, in order:
 //   1. Stop every poll handle (uv__io_poll must never see the dead fds).
-//   2. Tear down and re-open the bsd service session (socketExit +
-//      socketInitialize): all socket fds become invalid sysmodule-side,
-//      together with any stale per-session state.
-//   3. Snapshot + detach the stale registry, then fire every pending JS op
-//      with ECONNRESET — apps observe their sockets dying and reconnect on
-//      the fresh session. (Callbacks may open new sockets here; their
-//      registry nodes prepend to the now-empty list and are NOT touched by
-//      step 4.)
-//   4. Free the stale poll handles WITHOUT close(): the fds died with the
-//      old session; close() on them is meaningless at best.
+//   2. Mark the fds dead (bounded registry) — they are NEVER closed:
+//      close() on a wake-dead socket is exactly the class of sysmodule
+//      op that asserts. They leak (a handful per sleep); read/write/close
+//      calls against them fail fast with EBADF instead of touching the
+//      sysmodule.
+//   3. Snapshot + detach the stale registry, then fire every pending JS
+//      op with ECONNRESET — apps observe their sockets dying and reconnect
+//      on the intact session (~1 s later), which works (ftpd-verified).
+//   4. Free the stale poll handles WITHOUT close().
+static int g_dead_fds[64];
+static int g_dead_fd_count = 0;
+
+static bool fd_is_dead(int fd) {
+	for (int i = 0; i < g_dead_fd_count; i++)
+		if (g_dead_fds[i] == fd)
+			return true;
+	return false;
+}
+
 static void nx_tcp_wake_reset_impl(void) {
 	int count = 0;
 	for (fd_reg_node_t *n = g_tcp_fds; n; n = n->next)
 		count++;
 	fprintf(stderr, "[tcp] wake reset: %d socket(s)\n", count);
+	if (count == 0)
+		return; // nothing held at sleep — nothing to do
 
-	// 1.
+	// 1. + 2.
 	for (fd_reg_node_t *n = g_tcp_fds; n; n = n->next) {
 		fd_poll_t *fp = n->entry;
 		uv_poll_stop(&fp->poll);
 		fp->closing = true; // fd_poll_get/refresh must not revive it
 		fp->close_fd = false;
-	}
-
-	// 2. (nx_socket_session_reset is defined in main.cc — it re-uses the
-	// effective SocketInitConfig selected for the current memory regime.)
-	Result rc = nx_socket_session_reset();
-	if (R_FAILED(rc)) {
-		fprintf(stderr,
-		        "[tcp] wake reset: socketInitialize failed 0x%x\n", rc);
+		if (g_dead_fd_count < 64)
+			g_dead_fds[g_dead_fd_count++] = fp->fd;
 	}
 
 	// 3.

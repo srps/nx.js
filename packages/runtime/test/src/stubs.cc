@@ -19,14 +19,6 @@
 #include "types.h"
 #include <v8.h>
 
-// Socket session reset (defined in source/main.cc on device: socketExit +
-// socketInitialize with the regime config). The host harness has no bsd
-// service session, so resetting is a no-op success — it only needs to exist
-// so tcp.cc (compiled from source/) links.
-Result nx_socket_session_reset(void) {
-	return 0;
-}
-
 // libnx exposes the newlib heap bounds as `fake_heap_start`/`fake_heap_end`;
 // async.cc (compiled from source/) uses them to gauge native-heap pressure on
 // device. The host has a normal glibc heap with no such bounds, so provide the

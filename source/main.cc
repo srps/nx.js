@@ -1299,13 +1299,9 @@ static const SocketInitConfig *nx_effective_socket_cfg(void) {
 // sleep/wake reset — see nx_tcp_wake_reset() in tcp.cc). Returns the
 // socketInitialize() result. All socket fds held by the process become
 // invalid when the old session closes; callers must not close() them.
-Result nx_socket_session_reset(void) {
-	socketExit();
-	return socketInitialize(&g_effective_socket_cfg);
-}
-
-// Defined in tcp.cc: full socket-layer teardown + bsd session reset for
-// console sleep/wake (called from the main event loop).
+// Defined in tcp.cc: soft socket-layer reset for console sleep/wake (called
+// from the main event loop). Does NOT touch the bsd service session — see
+// tcp.cc for why (libuv-horizon's self-wake socketpair lives on it).
 void nx_tcp_wake_reset(void);
 
 // Resolve the user entrypoint and (for standalone / bootstrap-.nro launches)
