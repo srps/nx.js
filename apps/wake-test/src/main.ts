@@ -10,6 +10,10 @@
  * Config: sdmc:/switch/wake-test.json → { "url": "ws://<bridge>:8787/..." }
  * (any WebSocket echo/server works; default below.)
  */
+// Tokenless default — this source is PUBLIC (fork repo). The deploy-time
+// config (sdmc:/switch/wake-test.json, written via ftpd) supplies the
+// tokened URL; without it the bridge refuses the connection loudly
+// (which the harness shows as an error line, not a silent loop).
 const DEFAULT_URL = 'ws://192.168.0.176:8787/';
 const CONFIG_PATH = 'sdmc:/switch/wake-test.json';
 const LOG_PATH = 'sdmc:/switch/wake-test.log';
@@ -75,7 +79,7 @@ let connectedOnce = false;
 
 function render() {
 	console.clear();
-	console.log('\x1b[1mwake-test6 [HOLD MODE]\x1b[0m — NO reconnect after wake');
+	console.log('\x1b[1mwake-test8 [HOLD]\x1b[0m — NO reconnect after wake');
 	console.log(`url:         ${masked} (${urlSource})`);
 	console.log(`reconnect:   ${reconnectMs}ms`);
 	console.log(`state:       ${state}`);

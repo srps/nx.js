@@ -76,8 +76,10 @@ struct fd_reg_node_t {
 fd_reg_node_t *g_tcp_fds = nullptr;
 
 // Forward: defined with the wake-reset machinery below; the JS-facing
-// read/write/close entry points check it to fail fast on wake-dead sockets.
+// read/write/close entry points check it to fail fast on wake-dead sockets,
+// and fd_poll_get clears it when a session-fresh fd re-registers.
 static bool fd_is_dead(int fd);
+static void fd_dead_clear(int fd);
 
 fd_poll_t *registry_find(int fd) {
 	for (fd_reg_node_t *n = g_tcp_fds; n; n = n->next) {
@@ -140,6 +142,14 @@ void fd_poll_refresh(fd_poll_t *fp) {
 
 // Get (or lazily create) the shared poll handle for `fd`.
 fd_poll_t *fd_poll_get(Isolate *iso, int fd) {
+	// A fd actively registering a poll is alive in the CURRENT bsd session
+	// by definition. The wake reset tears down and re-opens the session,
+	// after which the fresh session re-allocates fd numbers from scratch —
+	// a new socket can reuse a number still sitting in the dead-fd registry
+	// (marked when a previous session's socket died at wake). Without this
+	// clear, reads/writes on the healthy new socket would fail with a
+	// bogus EBADF and its close() would silently leak it.
+	fd_dead_clear(fd);
 	fd_poll_t *fp = registry_find(fd);
 	if (fp)
 		return fp;
@@ -548,10 +558,15 @@ void nx_tcp_close(const FunctionCallbackInfo<Value> &info) {
 //      it for socket-less apps was a display artifact (a harness bug froze
 //      the on-screen counters; the timers were fine all along).
 //   4. Snapshot + detach the stale registry, then fire every pending JS
-//      op with ECONNRESET — apps observe their sockets dying and
-//      reconnect on the fresh session. Apps should wait a few seconds
-//      before reconnecting (wake-test harness default: 8 s) — a +1 s
-//      reconnect tripped the sysmodule once (v1.0.0-beta.8 field run).
+//      op with ECONNRESET — apps observe their sockets dying and tear
+//      down cleanly. IMPORTANT for apps: do NOT reconnect in-process
+//      after a wake. Post-wake connect() on a fresh session trips the
+//      same sysmodule assert if attempted within ~a minute (+1 s and
+//      +8 s both field-fatal), and even a delayed successful reconnect
+//      (+60 s, working socket, live traffic) was followed by a sysmodule
+//      crash 1–2 minutes later. The only field-proven safe pattern is:
+//      observe the disconnect, hold, and let the user relaunch the app
+//      (a fresh process/session connects instantly and safely).
 //   5. Free the stale poll handles WITHOUT close() (fds died with the
 //      session; close() on them is meaningless at best).
 static int g_dead_fds[64];
@@ -562,6 +577,17 @@ static bool fd_is_dead(int fd) {
 		if (g_dead_fds[i] == fd)
 			return true;
 	return false;
+}
+
+// A fd re-registering a poll belongs to the current (post-reset) session —
+// un-dead-mark it (see fd_poll_get).
+static void fd_dead_clear(int fd) {
+	for (int i = 0; i < g_dead_fd_count; i++) {
+		if (g_dead_fds[i] == fd) {
+			g_dead_fds[i] = g_dead_fds[--g_dead_fd_count];
+			return;
+		}
+	}
 }
 
 static void nx_tcp_wake_reset_impl(void) {
@@ -597,7 +623,7 @@ static void nx_tcp_wake_reset_impl(void) {
 	}
 	fprintf(stderr, "[tcp] wake reset: bsd session reset\n");
 
-	// 5.
+	// 4.
 	fd_reg_node_t *stale = g_tcp_fds;
 	g_tcp_fds = nullptr;
 	for (fd_reg_node_t *n = stale; n; n = n->next) {

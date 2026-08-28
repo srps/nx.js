@@ -1304,10 +1304,6 @@ static const SocketInitConfig *nx_effective_socket_cfg(void) {
 // sleep/wake reset — see nx_tcp_wake_reset() in tcp.cc). Returns the
 // socketInitialize() result. All socket fds held by the process become
 // invalid when the old session closes; callers must not close() them.
-// Tear down and re-open the bsd service session (called by the runtime's
-// sleep/wake reset — see nx_tcp_wake_reset() in tcp.cc). Returns the
-// socketInitialize() result. All socket fds held by the process become
-// invalid when the old session closes; callers must not close() them.
 // This is REQUIRED, not optional: a wake-dead established connection left
 // in the session's tables asserts the bsdsocket sysmodule at the first
 // post-wake poll (User Break at bsdsocket+0xef0f0, field-verified via
@@ -1961,8 +1957,11 @@ int main(int argc, char *argv[]) {
 				// a 60s threshold missed short sleeps entirely (verified:
 				// a few-seconds screen-off crashed the console). Normal
 				// operation renders every ~16ms; a 2s frame stall without a
-				// single frame is already pathological, and a spurious reset
-				// is recoverable (sockets error, apps reconnect).
+				// single frame is already pathological. A SPURIOUS reset
+				// (long stall, no actual sleep) is harmless: the session
+				// reset itself is safe on a live console and apps may
+				// reconnect — unlike a real wake, where reconnecting
+				// in-process is fatal (see tcp.cc).
 				{
 					static u64 s_last_frame_wall = 0;
 					u64 now_wall = (u64)time(NULL);
