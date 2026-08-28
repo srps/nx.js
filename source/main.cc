@@ -1994,13 +1994,26 @@ int main(int argc, char *argv[]) {
 							    String::NewFromUtf8Literal(iso, "Switch");
 							if (global->Get(ctx, key).ToLocal(&switch_val) &&
 							    switch_val->IsObject()) {
-								switch_val.As<Object>()->Set(
-								    ctx,
-								    String::NewFromUtf8Literal(iso,
-								                                "lastWakeAt"),
-								    Number::New(
-								        iso,
-								        (double)(now_wall * 1000ull)));
+								Maybe<bool> ok_maybe =
+								    switch_val.As<Object>()->Set(
+								        ctx,
+								        String::NewFromUtf8Literal(
+								            iso, "lastWakeAt"),
+								        Number::New(
+								            iso,
+								            (double)(now_wall *
+								                     1000ull)));
+								fprintf(stderr,
+								        "[nxjs] lastWakeAt set: %s\n",
+								        ok_maybe.IsJust() &&
+								                ok_maybe.FromJust()
+								            ? "yes"
+								            : "NO");
+							} else {
+								fprintf(stderr,
+								        "[nxjs] lastWakeAt NOT set: "
+								        "Switch missing/not an "
+								        "object\n");
 							}
 						}
 					}

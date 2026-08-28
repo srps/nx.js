@@ -128,7 +128,9 @@ function connect() {
 		state = 'disconnected';
 		disconnects++;
 		if (connectedOnce) {
-			mark('close - HOLD (no reconnect; watch heartbeats vs the bomb)');
+			mark(
+				`close - HOLD (lastWakeAt=${(globalThis as any).Switch?.lastWakeAt ?? 'unset'})`,
+			);
 			return;
 		}
 		mark('close');
@@ -139,7 +141,9 @@ function connect() {
 	});
 }
 
+let tick = 0;
 setInterval(() => {
+	tick++;
 	const now = Date.now();
 	const gap = now - lastBeat;
 	lastBeat = now;
@@ -153,6 +157,11 @@ setInterval(() => {
 	// Redraw every tick: the visible counter IS the liveness signal (a
 	// frozen screen is indistinguishable from a dead loop otherwise).
 	render();
+	if (tick === 1) {
+		flog(
+			`lastWakeAt after wake=${(globalThis as any).Switch?.lastWakeAt ?? 'unset'}`,
+		);
+	}
 }, 5000);
 flog('starting connect loop');
 
