@@ -1978,6 +1978,31 @@ int main(int argc, char *argv[]) {
 						// (stderr is unbuffered — it lands).
 						fprintf(stderr,
 						        "[nxjs] wake reset returned\n");
+						// Tell JS a wake happened: set Switch.lastWakeAt
+						// (wall-clock ms). Apps must NOT reconnect in-process
+						// after a wake (sysmodule-fatal, see tcp.cc) — a
+						// timer-gap heuristic cannot detect wakes reliably
+						// (sleeps shorter than one tick period are invisible,
+						// and the disconnect outraces the first post-wake
+						// tick), so the runtime reports it deterministically.
+						{
+							TryCatch try_catch(iso);
+							Local<Context> ctx = iso->GetCurrentContext();
+							Local<Object> global = ctx->Global();
+							Local<Value> switch_val;
+							Local<String> key =
+							    String::NewFromUtf8Literal(iso, "Switch");
+							if (global->Get(ctx, key).ToLocal(&switch_val) &&
+							    switch_val->IsObject()) {
+								switch_val.As<Object>()->Set(
+								    ctx,
+								    String::NewFromUtf8Literal(iso,
+								                                "lastWakeAt"),
+								    Number::New(
+								        iso,
+								        (double)(now_wall * 1000ull)));
+							}
+						}
 					}
 					s_last_frame_wall = now_wall;
 				}
