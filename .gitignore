@@ -33,3 +33,12 @@ node_modules
 /.vscode/cache.db*
 test/runtime/build/
 test/runtime/dist/
+nxjs-v*.nro
+
+# local build outputs (keep the tree clean; artifacts come from CI)
+apps/*/romfs/main.js
+apps/*/romfs/main.js.map
+apps/*/*.nro
+stock-f41fb55/
+elf-archive/
+.pnpm-store/

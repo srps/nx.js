@@ -1,0 +1,52 @@
+name: runtime-build
+
+# Fork-only workflow: build the (wake-fix patched) runtime NRO on every push
+# so the branch always ships a deployable artifact. Reuses the same pinned
+# pacman-packages container as ci.yml (devkitPro + custom switch-* packages
+# preinstalled).
+on:
+  push:
+    branches:
+      - wake-fix
+  workflow_dispatch:
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  build:
+    name: Build runtime NRO
+    runs-on: ubuntu-latest
+    container: ghcr.io/tootallnate/pacman-packages@sha256:92880d77878639768fe3696800104d68de1dfec65802bf7915689dd7bd718e53
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js 22.x
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: package.json
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build dependent packages
+        run: pnpm build --filter @nx.js/runtime
+
+      - name: Bundle `runtime.js`
+        run: pnpm bundle
+
+      - name: Build `nxjs.nro`
+        run: make V=1
+
+      - name: Name artifact by runtime version
+        run: cp nxjs.nro "nxjs-v$(jq -r .version < packages/runtime/package.json).nro"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: runtime-nro
+          path: nxjs-v*.nro

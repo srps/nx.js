@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - wake-fix
     tags:
       - "!*"
   pull_request:

@@ -402,6 +402,18 @@ importers:
         specifier: 'catalog:'
         version: 0.27.3
 
+  apps/sleep-repro:
+    devDependencies:
+      '@nx.js/nro':
+        specifier: workspace:^
+        version: link:../../packages/nro
+      '@nx.js/runtime':
+        specifier: workspace:^
+        version: link:../../packages/runtime
+      esbuild:
+        specifier: 'catalog:'
+        version: 0.27.3
+
   apps/snake:
     dependencies:
       '@nx.js/constants':
@@ -536,6 +548,21 @@ importers:
       '@nx.js/constants':
         specifier: workspace:^
         version: link:../../packages/constants
+      '@nx.js/nro':
+        specifier: workspace:^
+        version: link:../../packages/nro
+      '@nx.js/nsp':
+        specifier: workspace:^
+        version: link:../../packages/nsp
+      '@nx.js/runtime':
+        specifier: workspace:^
+        version: link:../../packages/runtime
+      esbuild:
+        specifier: 'catalog:'
+        version: 0.27.3
+
+  apps/wake-test:
+    devDependencies:
       '@nx.js/nro':
         specifier: workspace:^
         version: link:../../packages/nro
