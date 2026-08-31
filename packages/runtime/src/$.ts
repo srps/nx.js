@@ -463,6 +463,7 @@ export interface Init {
 	writeFile(path: string, data: ArrayBuffer): Promise<void>;
 	writeFileSync(path: string, data: ArrayBuffer): void;
 	appendFileSync(path: string, data: ArrayBuffer): void;
+	commitDeviceSync(device: string): void;
 
 	// fsdev.c
 	fsInit(c: ClassOf<FileSystem>): void;

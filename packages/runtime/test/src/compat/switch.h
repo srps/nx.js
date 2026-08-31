@@ -309,6 +309,11 @@ static inline FsFileSystem *fsdevGetDeviceFileSystem(const char *name) {
 	return NULL;
 }
 
+static inline Result fsdevCommitDevice(const char *name) {
+	(void)name;
+	return 0; // Host contract stub; durability is Switch-only.
+}
+
 static inline Result fsFsCreateFile(FsFileSystem *fs, const char *path,
                                     s64 size, u32 option) {
 	(void)fs;
@@ -830,4 +835,3 @@ typedef struct {
 
 // TurboJPEG decode helper (used by main.c nx_render_loading_image)
 // The actual decode_jpeg function is defined in util.c
-

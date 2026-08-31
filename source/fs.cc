@@ -668,6 +668,21 @@ void nx_append_file_sync(const FunctionCallbackInfo<Value> &info) {
 	nx_write_file_sync_impl(info, true);
 }
 
+// Explicitly commit a mounted filesystem after synchronous crash logging.
+// fclose() flushes the file handle, but libnx documents fsdevCommitDevice()
+// as the durability boundary for mounted writable filesystems.
+void nx_commit_device_sync(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	String::Utf8Value device(iso, info[0]);
+	if (!*device || **device == '\0') {
+		nx_throw(iso, "device name must be a non-empty string");
+		return;
+	}
+	Result rc = fsdevCommitDevice(*device);
+	if (R_FAILED(rc))
+		nx_throw_libnx_error(iso, rc, "fsdevCommitDevice");
+}
+
 // ===================== openDir / readDirNext / closeDir =====================
 void opendir_do(nx_work_t *req) {
 	opendir_t *d = (opendir_t *)req->data;
@@ -938,4 +953,5 @@ void nx_init_fs(Isolate *iso, Local<Object> init_obj) {
 	NX_SET_FUNC(init_obj, "writeFile", nx_write_file);
 	NX_SET_FUNC(init_obj, "writeFileSync", nx_write_file_sync);
 	NX_SET_FUNC(init_obj, "appendFileSync", nx_append_file_sync);
+	NX_SET_FUNC(init_obj, "commitDeviceSync", nx_commit_device_sync);
 }

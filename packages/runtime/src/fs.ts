@@ -265,6 +265,21 @@ export function appendFileSync(path: PathLike, data: string | BufferSource) {
 }
 
 /**
+ * Commits pending writes for a mounted filesystem device.
+ *
+ * This is useful for crash breadcrumbs that must survive an abnormal process
+ * exit. The device name does not include a trailing colon (for example,
+ * `sdmc`). Ordinary applications usually do not need to call this after every
+ * write because committing can be comparatively expensive.
+ */
+export function commitDeviceSync(device: string) {
+	if (!device || device.includes(':') || device.includes('/') || device.includes('\\')) {
+		throw new TypeError('device must be a bare mounted device name');
+	}
+	$.commitDeviceSync(device);
+}
+
+/**
  * Removes the file or directory recursively specified by `path`.
  *
  * @param path File path to remove.
