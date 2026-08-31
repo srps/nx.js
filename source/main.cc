@@ -16,6 +16,7 @@
 #include <time.h>
 #include <turbojpeg.h>
 #include <uv.h>
+#include <poll.h>
 #include <v8.h>
 #include <webp/decode.h>
 #include <zlib.h>
@@ -193,6 +194,18 @@ static bool g_nv_early_ref = false;
 static void *g_display_parachute = NULL;
 static nx_context_t *g_nx_ctx = NULL;
 static uv_loop_t *g_loop = NULL;
+// Wall time of the last synchronous, potentially seconds-long native call on
+// the main thread (SD write/append/commit). The wake classifier treats a frame
+// gap that contains one of these as a stall, not a sleep.
+static u64 g_last_blocking_wall = 0;
+extern "C" void nx_note_blocking_native(void) { g_last_blocking_wall = (u64)time(NULL); }
+static u64 nx_main_thread_cpu_ms(void) {
+	u64 ticks = 0;
+	// [13.0.0+] ThreadTickCount; id1 = -1 -> all cores.
+	if (R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, (u64)-1)))
+		return 0;
+	return armTicksToNs(ticks) / 1000000ull;
+}
 static bool g_loop_initialized = false;
 static bool g_socket_initialized = false;
 static bool g_pl_initialized = false;
@@ -1396,6 +1409,61 @@ static const SocketInitConfig *nx_effective_socket_cfg(void) {
 	return &g_effective_socket_cfg;
 }
 
+// Tear down and re-open the bsd service session (called by the runtime's
+// sleep/wake reset — see nx_tcp_wake_reset() in tcp.cc). Returns the
+// socketInitialize() result. All socket fds held by the process become
+// invalid when the old session closes; callers must not close() them.
+// This is REQUIRED, not optional: a wake-dead established connection left
+// in the session's tables asserts the bsdsocket sysmodule at the first
+// post-wake poll (User Break at bsdsocket+0xef0f0, field-verified via
+// per-boot logs on v1.0.0-beta.10: full soft reset completed, death at the
+// next uv_run). Dropping the session removes the corpse before any poll
+// runs (v1.0.2 field pass: minutes of post-wake heartbeats, clean exit).
+// libuv's loop self-wake pair (uv__async_start → uv__make_pipe → libnx
+// pipe()/socket()) lives on the bsd session and dies with it — both at a
+// console sleep and at the reset below. The first threadpool completion after
+// that (e.g. the DNS lookup of the first post-wake fetch) hits
+// uv__async_send → write() fails → libuv abort()s from the WORKER thread,
+// which makes hbloader unload the NRO under the running main thread
+// (2347-0024) or tears the display down under mesa (2349-0004/0008).
+// Symbolicated on-device 2026-08-30 (nxjs-9ff0a5d6.elf, crash 01788055238).
+// Re-create the pair on the fresh session. The dead fds are abandoned, not
+// close()d: close on a wake-dead socket is the sysmodule-asserting op class.
+extern "C" void uv__io_stop(uv_loop_t *, uv__io_t *, unsigned int);
+static void nx_uv_async_recreate(uv_loop_t *loop) {
+	if (!loop)
+		return;
+	int old_r = loop->async_io_watcher.fd, old_w = loop->async_wfd;
+	if (old_r != -1)
+		uv__io_stop(loop, &loop->async_io_watcher, POLLIN);
+	loop->async_io_watcher.fd = -1;
+	loop->async_wfd = -1;
+	// uv_async_init() calls uv__async_start() when the watcher fd is -1.
+	uv_async_t *probe = (uv_async_t *)calloc(1, sizeof(uv_async_t));
+	int rc = uv_async_init(loop, probe, NULL);
+	if (rc == 0) {
+		uv_unref((uv_handle_t *)probe);
+		uv_close((uv_handle_t *)probe, [](uv_handle_t *h) { free(h); });
+	} else {
+		free(probe);
+	}
+	fprintf(stderr,
+	        "[uv] async self-wake pair re-created (old r=%d w=%d -> r=%d w=%d) rc=%d\n",
+	        old_r, old_w, loop->async_io_watcher.fd, loop->async_wfd, rc);
+	fflush(stderr);
+}
+
+Result nx_socket_session_reset(void) {
+	socketExit();
+	Result rc = socketInitialize(&g_effective_socket_cfg);
+	nx_uv_async_recreate(g_loop);
+	return rc;
+}
+
+// Defined in tcp.cc: socket-layer teardown + bsd session reset for console
+// sleep/wake (called from the main event loop).
+void nx_tcp_wake_reset(void);
+
 // Resolve the user entrypoint and (for standalone / bootstrap-.nro launches)
 // mount `romfs:`. Hoisted out of main()'s body so it can run BEFORE V8 init:
 // the entrypoint directory is needed to locate `nxjs.ini`, whose [v8]/[memory]
@@ -2009,6 +2077,7 @@ int main(int argc, char *argv[]) {
 		// an exit signal when NOT driving a GPU surface (legacy framebuffer apps
 		// rely on it to detect an OS-initiated close).
 		appletHook(&g_applet_hook_cookie, nx_applet_hook, NULL);
+		bool wake_hook_armed = false;
 		while (is_running) {
 			bool applet_active = appletMainLoop();
 			// GPU mode cannot trust appletMainLoop()'s bare false return (see
@@ -2028,6 +2097,106 @@ int main(int argc, char *argv[]) {
 			if (!screen_is_gpu && !nx_webgl_active() && !applet_active)
 				break;
 			if (!nx_ctx->had_error) {
+				// Reset stale BSD state only for an OS-issued resume event.
+				// Ignore a possible initial Resume message on the first loop;
+				// no socket can be wake-stale before the app has run a frame.
+				// Wall-clock fallback. Device evidence 2026-08-30 (#13 runtime):
+				// this title-takeover, hbloader-hosted process receives NO applet
+				// message across a sleep/wake — not OnResume, not OnFocusState —
+				// so hook-based detection never fires and the first post-wake
+				// socket use aborts from a libuv worker (uv__async_send on the
+				// stale bsd session → abort() → hbl unmap failure 2347-0024).
+				// A frame gap of >= 3 s is far above any synchronous stall we
+				// have measured (WASM compile ~1.4 s) and a spurious reset only
+				// costs an ECONNRESET on in-flight sockets.
+				// Sleep-vs-stall classifier (device data 2026-08-30):
+				//  * CNTPCT keeps running through sleep (288 s sleep -> 288,870 ms
+				//    of ticks), so tick-vs-wall cannot discriminate.
+				//  * This hbloader/title-takeover process gets no applet messages.
+				//  * Real sleeps can be short (an 8 s screen-off missed by a 12 s
+				//    threshold crashed the console); stalls of 5-8 s occur in normal
+				//    use (WASM compute, SD commit after a tool call).
+				// So: a gap >= 3 s is a WAKE unless the main thread was CPU-busy
+				// for it (WASM compute) or a known blocking native op (SD
+				// write/commit) ran inside it. Gaps >= 12 s that are not CPU-busy
+				// are always a wake (an SD commit does not take 12 s).
+				{
+					static u64 s_last_frame_wall = 0;
+					static u64 s_last_frame_cpu = 0;
+					u64 now_wall = (u64)time(NULL);
+					u64 now_cpu = nx_main_thread_cpu_ms();
+					if (s_last_frame_wall != 0 && now_wall - s_last_frame_wall >= 3) {
+						u64 gap_s = now_wall - s_last_frame_wall;
+						u64 cpu_ms = now_cpu - s_last_frame_cpu;
+						bool busy = cpu_ms * 100 >= gap_s * 1000 * 40; // >= 40% of the gap on CPU
+						bool blocking = g_last_blocking_wall >= s_last_frame_wall &&
+						                g_last_blocking_wall <= now_wall;
+						bool wake = !busy && (!blocking || gap_s >= 12) && !g_applet_resume_pending;
+						fprintf(stderr,
+						        "[nxjs] frame gap wall=%llus cpu=%llums busy=%d blocking=%d t=%llu -> %s\n",
+						        (unsigned long long)gap_s, (unsigned long long)cpu_ms,
+						        (int)busy, (int)blocking, (unsigned long long)now_wall,
+						        wake ? "treating as wake" : "stall (ignored)");
+						fflush(stderr);
+						if (wake)
+							g_applet_resume_pending = true;
+					}
+					s_last_frame_wall = now_wall;
+					s_last_frame_cpu = now_cpu;
+				}
+				if (g_applet_resume_pending) {
+					g_applet_resume_pending = false;
+					if (wake_hook_armed) {
+						u64 now_wall = (u64)time(NULL);
+						fprintf(stderr,
+						        "[nxjs] resume event - resetting sockets\n");
+						nx_tcp_wake_reset();
+						// Breadcrumb: distinguishes a death
+						// INSIDE the reset from one after it
+						// (stderr is unbuffered — it lands).
+						fprintf(stderr,
+						        "[nxjs] wake reset returned\n");
+						// Tell JS a wake happened: set Switch.lastWakeAt
+						// (wall-clock ms). Apps must NOT reconnect in-process
+						// after a wake (sysmodule-fatal, see tcp.cc) — a
+						// timer-gap heuristic cannot detect wakes reliably
+						// (sleeps shorter than one tick period are invisible,
+						// and the disconnect outraces the first post-wake
+						// tick), so the runtime reports it deterministically.
+						{
+							TryCatch try_catch(iso);
+							Local<Context> ctx = iso->GetCurrentContext();
+							Local<Object> global = ctx->Global();
+							Local<Value> switch_val;
+							Local<String> key =
+							    String::NewFromUtf8Literal(iso, "Switch");
+							if (global->Get(ctx, key).ToLocal(&switch_val) &&
+							    switch_val->IsObject()) {
+								Maybe<bool> ok_maybe =
+								    switch_val.As<Object>()->Set(
+								        ctx,
+								        String::NewFromUtf8Literal(
+								            iso, "lastWakeAt"),
+								        Number::New(
+								            iso,
+								            (double)(now_wall *
+								                     1000ull)));
+								fprintf(stderr,
+								        "[nxjs] lastWakeAt set: %s\n",
+								        ok_maybe.IsJust() &&
+								                ok_maybe.FromJust()
+								            ? "yes"
+								            : "NO");
+							} else {
+								fprintf(stderr,
+								        "[nxjs] lastWakeAt NOT set: "
+								        "Switch missing/not an "
+								        "object\n");
+							}
+						}
+					}
+				}
+				wake_hook_armed = true;
 				// libuv: sockets, fs, dns, threadpool afters, timers.
 				uv_run(&loop, UV_RUN_NOWAIT);
 				// Drain V8 microtasks (promise reactions).

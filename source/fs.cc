@@ -9,6 +9,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
+extern "C" void nx_note_blocking_native(void);
+
 using namespace v8;
 
 namespace {
@@ -662,10 +664,12 @@ static void nx_write_file_sync_impl(const FunctionCallbackInfo<Value> &info,
 
 void nx_write_file_sync(const FunctionCallbackInfo<Value> &info) {
 	nx_write_file_sync_impl(info, false);
+	nx_note_blocking_native();
 }
 
 void nx_append_file_sync(const FunctionCallbackInfo<Value> &info) {
 	nx_write_file_sync_impl(info, true);
+	nx_note_blocking_native();
 }
 
 // Explicitly commit a mounted filesystem after synchronous crash logging.
@@ -673,6 +677,7 @@ void nx_append_file_sync(const FunctionCallbackInfo<Value> &info) {
 // as the durability boundary for mounted writable filesystems.
 void nx_commit_device_sync(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
+	nx_note_blocking_native();
 	String::Utf8Value device(iso, info[0]);
 	if (!*device || **device == '\0') {
 		nx_throw(iso, "device name must be a non-empty string");
