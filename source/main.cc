@@ -195,6 +195,101 @@ static bool g_romfs_app_mounted = false;
 static bool g_mman_teardown_done = false;
 static bool g_emergency_teardown_started = false;
 static FILE *g_debug_fd = NULL;
+static AppletHookCookie g_applet_hook_cookie = {};
+static bool g_applet_resume_pending = false;
+static bool g_applet_exit_pending = false;
+
+// appletMainLoop() dispatches this synchronously on the main thread. Use the
+// OS resume notification rather than elapsed wall time: a long synchronous
+// compile or a LibraryApplet (notably the inline software keyboard) can pause
+// rendering for seconds without the console ever sleeping.
+// Every applet message is breadcrumbed: device runs on 2026-08-30 died after
+// a sleep/wake without a single OnResume ever being delivered to this
+// (title-takeover, hbloader-hosted) process, so which messages DO arrive is
+// itself the open question. Focus regained after a Background/OutOfFocus
+// period is treated as a resume fallback.
+static bool g_applet_was_unfocused = false;
+static void nx_applet_hook(AppletHookType hook, void *) {
+	const char *name = "?";
+	switch (hook) {
+	case AppletHookType_OnFocusState: name = "OnFocusState"; break;
+	case AppletHookType_OnOperationMode: name = "OnOperationMode"; break;
+	case AppletHookType_OnPerformanceMode: name = "OnPerformanceMode"; break;
+	case AppletHookType_OnExitRequest: name = "OnExitRequest"; break;
+	case AppletHookType_OnResume: name = "OnResume"; break;
+	case AppletHookType_OnCaptureButtonShortPressed: name = "OnCaptureButtonShortPressed"; break;
+	case AppletHookType_OnAlbumScreenShotTaken: name = "OnAlbumScreenShotTaken"; break;
+	case AppletHookType_RequestToDisplay: name = "RequestToDisplay"; break;
+	default: break;
+	}
+	AppletFocusState focus = appletGetFocusState();
+	fprintf(stderr, "[applet] hook %s (%d) focus=%d t=%llu\n", name, (int)hook,
+	        (int)focus, (unsigned long long)time(NULL));
+	fflush(stderr);
+	if (hook == AppletHookType_OnResume) {
+		g_applet_resume_pending = true;
+	} else if (hook == AppletHookType_OnExitRequest) {
+		g_applet_exit_pending = true;
+	} else if (hook == AppletHookType_OnFocusState) {
+		if (focus == AppletFocusState_InFocus) {
+			if (g_applet_was_unfocused) {
+				fprintf(stderr, "[applet] focus regained after background - treating as resume\n");
+				fflush(stderr);
+				g_applet_resume_pending = true;
+			}
+			g_applet_was_unfocused = false;
+		} else {
+			g_applet_was_unfocused = true;
+		}
+	}
+}
+
+static void nx_configure_pads(nx_context_t *ctx) {
+	padConfigureInput(8,
+	                  HidNpadStyleSet_NpadStandard | HidNpadStyleTag_NpadGc);
+	padInitializeDefault(&ctx->pads[0]);
+	for (int i = 1; i < 8; i++) {
+		padInitialize(&ctx->pads[i],
+		              (HidNpadIdType)(HidNpadIdType_No1 + i));
+	}
+}
+
+// padUpdate() aborts the entire process when libnx's HID shared-memory mapping
+// is absent (Module_Libnx/NotInitialized, 0x1159). A physical-console report
+// showed that invariant fail immediately after the inline keyboard submitted.
+// Check the invariant before entering libnx's abort-only API and attempt one
+// normal service reinitialization. If recovery fails, leave controller input
+// disabled and keep the JS/WASM process alive so the flight recorder survives.
+static bool nx_hid_ready_for_pad_update(nx_context_t *ctx) {
+	static bool recovery_attempted = false;
+	if (hidGetSharedmemAddr() != NULL)
+		return true;
+	if (recovery_attempted)
+		return false;
+	recovery_attempted = true;
+
+	fprintf(stderr,
+	        "[hid] shared memory missing before padUpdate; attempting "
+	        "hidInitialize\n");
+	Result rc = hidInitialize();
+	if (R_FAILED(rc) || hidGetSharedmemAddr() == NULL) {
+		fprintf(stderr,
+		        "[hid] recovery failed: rc=0x%x sharedmem=%s; controller "
+		        "polling disabled\n",
+		        rc, hidGetSharedmemAddr() == NULL ? "NULL" : "ready");
+		// Balance the reference added above if the guard claimed success but
+		// did not restore the mapping.
+		if (R_SUCCEEDED(rc))
+			hidExit();
+		fflush(stderr);
+		return false;
+	}
+
+	nx_configure_pads(ctx);
+	fprintf(stderr, "[hid] service + pads recovered\n");
+	fflush(stderr);
+	return true;
+}
 
 static void nx_display_parachute_release(void) {
 	if (g_display_parachute != NULL) {
@@ -1795,12 +1890,7 @@ int main(int argc, char *argv[]) {
 	// Microtasks are pumped explicitly from the loop.
 	iso->SetMicrotasksPolicy(MicrotasksPolicy::kExplicit);
 
-	padConfigureInput(8, HidNpadStyleSet_NpadStandard | HidNpadStyleTag_NpadGc);
-	padInitializeDefault(&nx_ctx->pads[0]);
-	for (int i = 1; i < 8; i++) {
-		padInitialize(&nx_ctx->pads[i],
-		              (HidNpadIdType)(HidNpadIdType_No1 + i));
-	}
+	nx_configure_pads(nx_ctx);
 
 	// `hid:sys` for hardware-backed Gamepad.id (serial numbers) + the
 	// controller connect/disconnect event. Non-fatal: on failure, Gamepad.id
@@ -1899,8 +1989,17 @@ int main(int argc, char *argv[]) {
 		// loop for applet message processing; its return value is only honored as
 		// an exit signal when NOT driving a GPU surface (legacy framebuffer apps
 		// rely on it to detect an OS-initiated close).
+		appletHook(&g_applet_hook_cookie, nx_applet_hook, NULL);
 		while (is_running) {
 			bool applet_active = appletMainLoop();
+			// GPU mode cannot trust appletMainLoop()'s bare false return (see
+			// below), but the explicit AM exit hook is authoritative. Honor it on
+			// every rendering path so libnx can return through __appExit/appletExit.
+			if (g_applet_exit_pending) {
+				fprintf(stderr, "[nxjs] applet exit requested; clean teardown\n");
+				fflush(stderr);
+				break;
+			}
 			// When the screen is GPU-backed, EGL owns the NWindow and
 			// appletMainLoop() can return false immediately, which would end the
 			// loop at frame 1 before a clean exit (leaking V8's svcMapMemory
@@ -1920,10 +2019,18 @@ int main(int argc, char *argv[]) {
 				}
 			}
 
-			for (int i = 0; i < 8; i++) {
-				padUpdate(&nx_ctx->pads[i]);
+			// A JS task may have called Switch.exit() during uv/microtasks.
+			// Do not perform another native service call after that request.
+			if (!is_running)
+				break;
+
+			u64 kDown = 0;
+			if (nx_hid_ready_for_pad_update(nx_ctx)) {
+				for (int i = 0; i < 8; i++) {
+					padUpdate(&nx_ctx->pads[i]);
+				}
+				kDown = padGetButtonsDown(&nx_ctx->pads[0]);
 			}
-			u64 kDown = padGetButtonsDown(&nx_ctx->pads[0]);
 			bool plusDown = kDown & HidNpadButton_Plus;
 
 			// `+` is handled by the JS frame handler below ($.onFrame dispatches
@@ -1932,11 +2039,6 @@ int main(int argc, char *argv[]) {
 			// native break would bypass preventDefault() (e.g. snake pausing on
 			// + during gameplay instead of exiting). The no-frame-handler case
 			// still exits on + via the branch further down.
-
-			// Script called Switch.exit(): break from any state so we always
-			// reach teardown (incl. horizon_mman_teardown()).
-			if (!is_running)
-				break;
 
 			if (nx_ctx->had_error) {
 				if (plusDown)
@@ -1993,6 +2095,7 @@ int main(int argc, char *argv[]) {
 				}
 			}
 		}
+		appletUnhook(&g_applet_hook_cookie);
 
 		// ---- Exit handler ------------------------------------------------
 		if (!nx_ctx->exit_handler.IsEmpty()) {
