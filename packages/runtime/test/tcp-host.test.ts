@@ -52,6 +52,12 @@ describe('tcp dispatch (host)', () => {
 						res.writeHead(200);
 						res.end('delivered');
 					}, 1200);
+				} else if (req.url === '/stream') {
+					// Endless slow drip — the fixture aborts mid-body. Stop
+					// on close so the interval doesn't outlive the socket.
+					res.writeHead(200, { 'content-type': 'text/plain' });
+					const timer = setInterval(() => res.write('chunk\n'), 100);
+					res.on('close', () => clearInterval(timer));
 				} else if (req.url === '/abort') {
 					// Destroy mid-response: the client's pending read must
 					// surface an error, not hang.

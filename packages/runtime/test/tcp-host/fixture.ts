@@ -53,6 +53,54 @@ test('tcp: abrupt disconnect surfaces as an error', async (t) => {
 	t.equal(outcome, 'rejected', 'fetch rejected (disconnect surfaced to JS)');
 });
 
+test('fetch: abort mid-stream rejects cleanly (locked body pipe)', async (t) => {
+	// Regression guard: the request's abort listener used to call
+	// readable.cancel()/writable.abort() on LOCKED streams (the response
+	// body pipe holds the readable's lock), throwing "Cannot abort/cancel a
+	// stream that already has a writer/reader" from the listener instead of
+	// aborting the fetch. Outcome-based: the body read must reject and a
+	// fresh request must still work afterwards.
+	const controller = new AbortController();
+	const res = await withTimeout(
+		fetch(`${base}/stream`, { signal: controller.signal }),
+		8000,
+		'/stream fetch',
+	);
+	t.equal(res.status, 200, 'streaming response opened');
+	const reader = res.body!.getReader();
+	const first = await withTimeout(reader.read(), 4000, 'first chunk');
+	t.equal(first.done, false, 'first chunk arrived before abort');
+	// The historical bug: the abort listener called cancel()/abort() on
+	// LOCKED streams, THREW (surfacing as a runtime error event), and the
+	// pending read hung forever. So (a) capture error events, (b) a read
+	// that only settles via our timeout counts as HUNG, not rejected.
+	const errorEvents: string[] = [];
+	const onError = (e: any) => {
+		errorEvents.push(String(e?.error ?? e?.message ?? e));
+		e.preventDefault?.();
+	};
+	addEventListener('error', onError);
+	controller.abort();
+	let outcome: 'rejected' | 'resolved' | 'hung' = 'resolved';
+	try {
+		for (;;) {
+			const r = await withTimeout(reader.read(), 3000, 'post-abort read');
+			if (r.done) break;
+		}
+	} catch (err) {
+		outcome = String(err).includes('timed out') ? 'hung' : 'rejected';
+	}
+	removeEventListener('error', onError);
+	t.equal(outcome, 'rejected', 'body read rejected promptly after abort');
+	t.equal(
+		errorEvents.filter((m) => m.includes('already has a')).length,
+		0,
+		'no locked-stream throw escaped the abort listener',
+	);
+	const ok = await withTimeout(fetch(`${base}/ok`), 8000, '/ok after abort');
+	t.equal(ok.status, 200, 'fresh socket works after aborted fetch');
+});
+
 test('tcp: fresh connections work after a disconnect', async (t) => {
 	const res = await withTimeout(fetch(`${base}/ok`), 8000, '/ok fetch');
 	t.equal(res.status, 200, 'fresh socket connected');

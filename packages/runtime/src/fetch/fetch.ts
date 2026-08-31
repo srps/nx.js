@@ -181,9 +181,19 @@ async function fetchHttp(
 				const err =
 					req.signal.reason ??
 					new DOMException('The operation was aborted.', 'AbortError');
-				socket.readable.cancel(err);
-				socket.writable.abort(err);
-				socket.close();
+				// The streams may be locked (header parsing holds a reader;
+				// the response body pipe holds one for the life of the
+				// stream) — `cancel()`/`abort()` on a locked stream throws.
+				// `close()` performs the same teardown with lock guards, and
+				// the body pipe aborts via the `signal` passed to
+				// `pipeThrough()` below.
+				if (!socket.readable.locked) {
+					socket.readable.cancel(err);
+				}
+				if (!socket.writable.locked) {
+					socket.writable.abort(err);
+				}
+				socket.close(err);
 			},
 			{ once: true },
 		);
@@ -358,7 +368,10 @@ async function fetchHttp(
 		w.releaseLock();
 		leftover = undefined;
 	}
-	let resBody = socket.readable.pipeThrough(resStream);
+	let resBody = socket.readable.pipeThrough(
+		resStream,
+		req.signal ? { signal: req.signal } : undefined,
+	);
 
 	// Decompress the response if the "content-encoding"
 	// header is set to a supported decompression format
