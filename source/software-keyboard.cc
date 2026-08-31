@@ -179,6 +179,20 @@ void nx_swkbd_show(const FunctionCallbackInfo<Value> &info) {
 	data->appearArg.returnButtonFlag = opt_bool(iso, o, "enableReturn");
 	data->appearArg.stringLenMin = opt_int(iso, o, "minLength", 0);
 	data->appearArg.stringLenMax = opt_int(iso, o, "maxLength", 0);
+	// After a DecidedEnter the applet clears its text but keeps the previous
+	// cursor position; on the next Appear every keystroke is inserted past the
+	// end of the (empty) buffer and dropped, so ChangedString reports "" for
+	// each key. Reproduced deterministically on a stock build with a
+	// keyboard-only app (10 sessions, 2026-08-30): resetting the cursor before
+	// Appear restores input, a Disappear round-trip alone does not. Reset the
+	// cursor to the end of whatever text JS assigned (0 for a fresh prompt).
+	{
+		Local<Value> v;
+		int32_t cursor = 0;
+		if (o->Get(ctx, nx_str(iso, "value")).ToLocal(&v) && v->IsString())
+			cursor = v.As<String>()->Length();
+		swkbdInlineSetCursorPos(&data->kbdinline, cursor);
+	}
 	swkbdInlineAppear(&data->kbdinline, &data->appearArg);
 
 	int x = 0, y = 0, width = 0, height = 0;
@@ -231,8 +245,10 @@ void nx_swkbd_set_input_text(const FunctionCallbackInfo<Value> &info) {
 	if (!data)
 		return;
 	String::Utf8Value value(iso, info[1]);
-	if (*value)
-		swkbdInlineSetInputText(&data->kbdinline, *value);
+	// An empty string is a legitimate value: it is how JS clears the applet's
+	// text before reusing the keyboard. Skipping it left stale text/cursor
+	// state in the applet.
+	swkbdInlineSetInputText(&data->kbdinline, *value ? *value : "");
 }
 
 } // namespace
