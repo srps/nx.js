@@ -230,6 +230,12 @@ void nx_swkbd_hide(const FunctionCallbackInfo<Value> &info) {
 		return;
 	current_kbd = NULL;
 	swkbdInlineDisappear(&data->kbdinline);
+	// libnx requires an update after changing SwkbdInlineCalcArg. The JS side
+	// stops its animation-frame pump as part of hide(), so flush the disappear
+	// request here instead of leaving the LibraryApplet half-transitioned.
+	Result rc = swkbdInlineUpdate(&data->kbdinline, NULL);
+	if (R_FAILED(rc))
+		nx_throw_libnx_error(info.GetIsolate(), rc, "swkbdInlineUpdate");
 }
 
 void nx_swkbd_update(const FunctionCallbackInfo<Value> &info) {

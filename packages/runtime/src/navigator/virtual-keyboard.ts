@@ -145,6 +145,7 @@ function onHide(k: VirtualKeyboard) {
 
 function onCancel(this: VirtualKeyboard) {
 	onHide(this);
+	this.dispatchEvent(new Event('cancel'));
 }
 
 function onChange(this: VirtualKeyboard, str: string, ci: number) {
