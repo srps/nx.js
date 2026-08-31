@@ -39,7 +39,30 @@ typedef struct {
 	// read_op (only one op exists during the handshake).
 	tls_op_t *read_op;  // pending OP_HANDSHAKE or OP_READ (or null)
 	tls_op_t *write_op; // pending OP_WRITE (or null)
+	void *reg_next;     // live-context registry (see g_tls_contexts)
 } nx_tls_context_t;
+
+// Every live TLS connection, so the sleep/wake reset can settle in-flight
+// ops before the bsd session (and with it every fd) is dropped — otherwise
+// a pending tlsRead's promise never resolves and the app hangs
+// ("Thinking" forever after a wake reset orphaned a model stream).
+static nx_tls_context_t *g_tls_contexts = nullptr;
+
+static void tls_registry_add(nx_tls_context_t *data) {
+	data->reg_next = g_tls_contexts;
+	g_tls_contexts = data;
+}
+
+static void tls_registry_remove(nx_tls_context_t *data) {
+	nx_tls_context_t **pp = &g_tls_contexts;
+	while (*pp) {
+		if (*pp == data) {
+			*pp = static_cast<nx_tls_context_t *>(data->reg_next);
+			return;
+		}
+		pp = reinterpret_cast<nx_tls_context_t **>(&(*pp)->reg_next);
+	}
+}
 
 // Built-in CA cert IDs to load individually (one-at-a-time works around a
 // libnx SslCaCertificateId_All bounds-check bug). Trimmed comment list.
@@ -102,6 +125,7 @@ int nx_tls_load_ca_certs(nx_context_t *nx_ctx) {
 
 // Free the struct + its mbedtls net context. The single place that frees.
 static void tls_free_struct(nx_tls_context_t *data) {
+	tls_registry_remove(data);
 	mbedtls_net_free(&data->server_fd);
 	free(data);
 }
@@ -419,6 +443,55 @@ tls_op_t *tls_op_new(Isolate *iso, op_kind kind, nx_tls_context_t *data,
 	return op;
 }
 
+// Sleep/wake reset support: the bsd session is about to be dropped, which
+// kills every socket fd. Settle each pending TLS op (its fd can never become
+// ready again) with ECONNRESET so awaiting JS promises reject instead of
+// hanging, park the poll handle, and mark the fd dead so no later teardown
+// close()s a recycled fd number. Mirrors nx_tcp_wake_reset_impl (tcp.cc).
+extern "C" void nx_tls_wake_reset(void) {
+	int contexts = 0, settled = 0;
+	for (nx_tls_context_t *d = g_tls_contexts; d;
+	     d = static_cast<nx_tls_context_t *>(d->reg_next)) {
+		contexts++;
+		if (d->torn_down)
+			continue;
+		// Park the poll BEFORE settling: tls_op_finish -> tls_poll_refresh
+		// must not restart polling on a dying fd.
+		if (d->poll_init && !d->poll_closing) {
+			uv_poll_stop(&d->poll);
+			d->poll_closing = true;
+			uv_close(reinterpret_cast<uv_handle_t *>(&d->poll),
+			         [](uv_handle_t *h) {
+				         nx_tls_context_t *d =
+				             static_cast<nx_tls_context_t *>(h->data);
+				         d->poll_closing = false;
+				         if (d->want_free)
+					         tls_free_struct(d);
+			         });
+		}
+		// The fd dies with the session; nothing may close() it later (the
+		// number can be recycled by the fresh session).
+		d->fd_closed = true;
+		d->server_fd.fd = -1;
+		tls_op_t *ops[2] = {d->write_op, d->read_op};
+		for (tls_op_t *op : ops) {
+			if (!op)
+				continue;
+			Isolate *iso = op->iso;
+			HandleScope scope(iso);
+			Context::Scope cs(iso->GetCurrentContext());
+			tls_op_finish(
+			    op,
+			    Exception::Error(nx_str(
+			        iso, "ECONNRESET: socket session reset after sleep")),
+			    Undefined(iso));
+			settled++;
+		}
+	}
+	fprintf(stderr, "[tls] wake reset: %d context(s), %d op(s) settled\n",
+	        contexts, settled);
+}
+
 void nx_tls_handshake(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	Local<Context> context = iso->GetCurrentContext();
@@ -454,6 +527,7 @@ void nx_tls_handshake(const FunctionCallbackInfo<Value> &info) {
 	nx_tls_context_t *data =
 	    (nx_tls_context_t *)calloc(1, sizeof(nx_tls_context_t));
 	nx::Wrap<nx_tls_context_t>(iso, obj, data, free_tls_context);
+	tls_registry_add(data);
 	data->server_fd.fd = fd;
 	mbedtls_ssl_init(&data->ssl);
 	mbedtls_ssl_config_init(&data->conf);

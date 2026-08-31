@@ -21,6 +21,7 @@ using namespace v8;
 // declaration must stay at GLOBAL scope — an anonymous-namespace copy
 // shadows the definition and fails to link (learned the hard way).
 Result nx_socket_session_reset(void);
+extern "C" void nx_tls_wake_reset(void);
 
 namespace {
 
@@ -610,6 +611,12 @@ static void nx_tcp_wake_reset_impl(void) {
 			g_dead_fds[g_dead_fd_count++] = fp->fd;
 	}
 	fprintf(stderr, "[tcp] wake reset: polls stopped, fds dead-marked\n");
+
+	// TLS connections poll their own fds (tls.cc) and are not in g_tcp_fds;
+	// settle their pending ops before the session (and every fd) dies, or a
+	// fetch blocked on tlsRead hangs forever after a (possibly spurious)
+	// wake reset.
+	nx_tls_wake_reset();
 
 	// 3. Remove the corpse from the sysmodule before any post-wake poll.
 	// (nx_socket_session_reset is defined in main.cc — it re-uses the
