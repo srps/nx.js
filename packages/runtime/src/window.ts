@@ -133,6 +133,13 @@ export function addEventListener(
 	}
 	EventTarget.prototype.addEventListener.call(window, type, callback, options);
 }
+// Install the wrapper as the global — without this, the global
+// `addEventListener` resolves to the inherited `EventTarget.prototype`
+// method, the `initKeyboard()` gate never runs, and physical (USB/Bluetooth)
+// keyboard events are never dispatched to any application. The name is
+// passed explicitly because esbuild renames this identifier in the bundle
+// (it collides with other `addEventListener` declarations).
+def(addEventListener, 'addEventListener');
 
 /**
  * Removes the event listener in target's event listener list with the same type, callback, and options.
