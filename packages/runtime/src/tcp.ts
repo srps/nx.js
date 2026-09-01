@@ -219,11 +219,16 @@ export class Socket {
 		// readable (whose cancel handler re-enters close()).
 		i.readBuffer = undefined; // release the large read buffer promptly
 		i.opened.reject(reason);
+		// On an already-errored stream, cancel()/abort() return a promise
+		// rejected with the stream's stored error; nothing awaits them here,
+		// so without the catch each close() of a failed socket surfaces an
+		// "Uncaught (in promise)" for an error that was already delivered
+		// through the reader (observed after a sleep/wake socket reset).
 		if (!this.readable.locked) {
-			this.readable.cancel(reason);
+			this.readable.cancel(reason).catch(() => {});
 		}
 		if (!this.writable.locked) {
-			this.writable.abort(reason);
+			this.writable.abort(reason).catch(() => {});
 		}
 		if (i.tls) {
 			// TLS context owns its fd; tear it down natively (closes the
